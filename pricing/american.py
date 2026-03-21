@@ -8,32 +8,32 @@ from models.heston_european import heston_european_call_price
 
 from simulation.lsmc import american_put_lsmc_vec, american_call_lsmc_vec
 
-def american_put_without_dividends(S0, K, T, r, v0, kappa, theta, sigma, rho, M, N):
+def american_put_without_dividends(S0, K, r,T, v0, kappa, theta, sigma, rho, M, N):
     """
     Wrapper function that:
     1. Simulates Heston paths
     2. Applies LSMC
     """
-    S, v, dt = simulate_heston_paths_american_put_without_dividends( S0, T, r,v0, kappa, theta, sigma, rho, M, N)
+    S, v, dt = simulate_heston_paths_american_put_without_dividends( S0, r, T, v0, kappa, theta, sigma, rho, M, N)
 
     american_put_price_without_dividends = american_put_lsmc_vec(S, K, r, dt)
 
     return american_put_price_without_dividends 
 
-def american_put_with_dividends(S0, K, T, r, v0, kappa, theta, sigma, rho, M, N, q):
+def american_put_with_dividends(S0, K, r, T, v0, kappa, theta, sigma, rho, M, N, q):
     """
     Wrapper function that:
     1. Simulates Heston paths
     2. Applies LSMC
     """
-    S, v, dt = simulate_heston_paths_american_put_with_dividends( S0, T, r,v0, kappa, theta, sigma, rho, M, N, q)
+    S, v, dt = simulate_heston_paths_american_put_with_dividends( S0, r, T,v0, kappa, theta, sigma, rho, M, N, q)
 
     american_put_price_with_dividends = american_put_lsmc_vec(S, K, r, dt)
 
     return american_put_price_with_dividends
 
 #American call options without dividends (same as european call price)
-def american_call_without_dividends(S0, K, T, r, v0, kappa, theta, sigma, rho):
+def american_call_without_dividends(S0, K, r, T, v0, kappa, theta, sigma, rho):
 
     params = (v0 ,kappa, theta, sigma, rho)
 
@@ -48,10 +48,10 @@ def american_call_without_dividends(S0, K, T, r, v0, kappa, theta, sigma, rho):
 
 
 
-def american_call_with_dividends(S0, K, T, r, v0, kappa, theta, sigma, rho, M, N, q):
+def american_call_with_dividends(S0, K, r, T, v0, kappa, theta, sigma, rho, M, N, q):
 
     # 1️⃣ Simulate paths
-    S, v, dt = simulate_heston_paths_american_call_with_dividends(S0, T, r, v0, kappa, theta, sigma, rho, M, N, q
+    S, v, dt = simulate_heston_paths_american_call_with_dividends(S0, r, T, v0, kappa, theta, sigma, rho, M, N, q
     )
     #pricing from lsmc
     american_call_price_with_dividends = american_call_lsmc_vec(S, K, r, dt)
