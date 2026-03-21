@@ -3,7 +3,7 @@ from scipy.stats import norm
 from scipy.optimize import brentq
 
 
-def black_scholes_price(S, K, T, r, sigma, option_type, q):
+def black_scholes_price(S, K, r, T, sigma, option_type, q):
     """
     European Black-Scholes price with continuous dividend yield.
     """

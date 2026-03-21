@@ -35,7 +35,7 @@ def heston_european_call_option(S0, K, r, T, v0, kappa, theta, sigma, rho):
 
 def heston_european_put_option(S0, K, r, T, v0, kappa, theta, sigma, rho):
     
-    params = (kappa, theta, sigma, rho, v0)
+    params = (v0, kappa, theta, sigma, rho)
 
     european_put_price = heston_european_put_price(
         S0=S0,
@@ -44,5 +44,5 @@ def heston_european_put_option(S0, K, r, T, v0, kappa, theta, sigma, rho):
         T=T,
         params=params
     )
-
+    
     return european_put_price

@@ -3,7 +3,7 @@
 # ---------------------------
 
 import numpy as np
-def simulate_heston_paths_american_put_without_dividends(S0, T, r, v0, kappa, theta, sigma, rho, M, N):
+def simulate_heston_paths_american_put_without_dividends(S0, r, T, v0, kappa, theta, sigma, rho, M, N):
     """Simulate Heston paths without dividends (American Put pricing)"""
     dt = T / M
     S = np.zeros((N, M+1))
@@ -34,7 +34,7 @@ def simulate_heston_paths_american_put_without_dividends(S0, T, r, v0, kappa, th
     return S, v, dt
 
 
-def simulate_heston_paths_american_put_with_dividends(S0, T, r, v0, kappa, theta, sigma, rho, M, N, q):
+def simulate_heston_paths_american_put_with_dividends(S0, r, T, v0, kappa, theta, sigma, rho, M, N, q):
     """
     Simulate Heston paths under risk-neutral measure with continuous dividends.
 
@@ -77,7 +77,7 @@ def simulate_heston_paths_american_put_with_dividends(S0, T, r, v0, kappa, theta
     
 
 
-def simulate_heston_paths_american_call_with_dividends(S0, T, r, v0, kappa, theta, sigma, rho, M, N, q):
+def simulate_heston_paths_american_call_with_dividends(S0, r, T, v0, kappa, theta, sigma, rho, M, N, q):
     """Simulate Heston paths with dividend yield q (American Call pricing)"""
     dt = T / N
     S = np.zeros((M, N+1))
