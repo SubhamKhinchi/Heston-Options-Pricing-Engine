@@ -17,3 +17,7 @@ ENV/
 
 DOCS.md
 PLAN.md
+CLAUDE.md
+
+*.json
+*.xlsx

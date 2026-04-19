@@ -19,7 +19,7 @@ from services.calibration_service import (
     load_saved_calibration,
     save_calibration_result,
 )
-from services.market_service import DEFAULT_SAMPLE_PATH, filter_option_chain, load_option_chain, parse_tickers
+from services.market_service import filter_chain_with_stats, load_live_chain, parse_tickers
 from services.pricing_service import HestonParameters
 
 
@@ -70,20 +70,6 @@ def model_params_from_meta(calibration_meta: dict[str, float]) -> HestonParamete
 
 def render_sidebar_controls(page_key: str) -> dict[str, object]:
     st.sidebar.header("Market Data")
-    source_label = st.sidebar.selectbox(
-        "Source",
-        ("Sample snapshot", "Yahoo Finance"),
-        index=0,
-        key=f"{page_key}_source",
-    )
-    source = "sample" if source_label == "Sample snapshot" else "live"
-
-    sample_path = st.sidebar.text_input(
-        "Sample path",
-        value=str(DEFAULT_SAMPLE_PATH),
-        key=f"{page_key}_sample_path",
-        disabled=source != "sample",
-    )
     tickers_text = st.sidebar.text_input(
         "Tickers",
         value="NVDA",
@@ -150,8 +136,8 @@ def render_sidebar_controls(page_key: str) -> dict[str, object]:
     max_contracts = st.sidebar.number_input(
         "Max contracts in view",
         min_value=25,
-        max_value=2000,
-        value=400,
+        max_value=5000,
+        value=2000,
         step=25,
         key=f"{page_key}_max_contracts",
     )
@@ -219,8 +205,6 @@ def render_sidebar_controls(page_key: str) -> dict[str, object]:
     calibration_style = "fast" if calibration_style_label.startswith("Fast") else "full"
 
     return {
-        "source": source,
-        "sample_path": sample_path,
         "tickers_text": tickers_text,
         "r": float(r),
         "q": float(q),
@@ -245,36 +229,28 @@ def render_sidebar_controls(page_key: str) -> dict[str, object]:
 
 
 @st.cache_data(show_spinner=False)
-def cached_load_chain(
-    source: str,
-    sample_path: str,
-    tickers_text: str,
-    spread_limit: float,
-    r: float,
-    q: float,
-) -> pd.DataFrame:
-    return load_option_chain(
-        source=source,
-        sample_path=sample_path,
-        tickers=parse_tickers(tickers_text),
-        spread_limit=spread_limit,
-        r=r,
-        q=q,
-    )
+def cached_load_chain(tickers_text: str) -> pd.DataFrame:
+    return load_live_chain(tickers=parse_tickers(tickers_text))
 
 
 @st.cache_data(show_spinner=False)
 def cached_filter_chain(
     raw_df: pd.DataFrame,
     tickers_text: str,
+    spread_limit: float,
+    r: float,
+    q: float,
     option_types: tuple[str, ...],
     min_volume: int,
     min_open_interest: int,
     max_maturity: float,
     max_contracts: int,
-) -> pd.DataFrame:
-    return filter_option_chain(
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    return filter_chain_with_stats(
         raw_df,
+        spread_limit=spread_limit,
+        r=r,
+        q=q,
         tickers=parse_tickers(tickers_text),
         option_types=option_types,
         min_volume=min_volume,
@@ -398,26 +374,23 @@ def load_app_data(
     if config["refresh_requested"]:
         clear_data_caches()
 
-    raw_df = cached_load_chain(
-        source=str(config["source"]),
-        sample_path=str(config["sample_path"]),
+    raw_df = cached_load_chain(tickers_text=str(config["tickers_text"]))
+    filtered_df, filter_stats = cached_filter_chain(
+        raw_df,
         tickers_text=str(config["tickers_text"]),
         spread_limit=float(config["spread_limit"]),
         r=float(config["r"]),
         q=float(config["q"]),
-    )
-    filtered_df = cached_filter_chain(
-        raw_df,
-        tickers_text=str(config["tickers_text"]),
         option_types=tuple(config["option_types"]),
         min_volume=int(config["min_volume"]),
         min_open_interest=int(config["min_open_interest"]),
         max_maturity=float(config["max_maturity"]),
         max_contracts=int(config["max_contracts"]),
     )
+    st.session_state["_filter_stats"] = filter_stats
 
     scope_id = calibration_scope_id(
-        source=str(config["source"]),
+        source="live",
         tickers_text=str(config["tickers_text"]),
         r=float(config["r"]),
         q=float(config["q"]),
