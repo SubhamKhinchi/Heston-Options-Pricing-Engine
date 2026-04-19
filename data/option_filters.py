@@ -1,14 +1,89 @@
+from __future__ import annotations
+
+import numpy as np
 import pandas as pd
 
 
-def liquid_options(df: pd.DataFrame, spread_limit=0.05):
-    # Removing completely illiquid options
-    df_volume = df[df.volume > 0].copy()
+def _drop(df: pd.DataFrame, mask: pd.Series, reason: str, stats: dict[str, int]) -> pd.DataFrame:
+    n = int(mask.sum())
+    if n:
+        stats[reason] = stats.get(reason, 0) + n
+    return df[~mask].copy()
 
-    # Calculating mid price
-    mid = (df_volume.ask + df_volume.bid) / 2
 
-    # Removing wide bid-ask spreads (relative to mid price)
-    df_final = df_volume[(df_volume.ask - df_volume.bid) / mid < spread_limit]
+def apply_filters(
+    df: pd.DataFrame,
+    *,
+    spread_limit: float = 0.05,
+    r: float = 0.05,
+    q: float = 0.0,
+    min_mid_price: float = 1e-3,
+    moneyness_lo: float = 0.8,
+    moneyness_hi: float = 1.2,
+    tickers: list[str] | None = None,
+    option_types: tuple[str, ...] | None = None,
+    min_volume: int = 0,
+    min_open_interest: int = 0,
+    max_maturity: float | None = None,
+    keep_positive_time: bool = True,
+    max_contracts: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Apply all option filters in one pass. Returns (filtered_df, stats) where stats maps each filter reason to contracts dropped."""
+    stats: dict[str, int] = {}
 
-    return df_final
+    # 1. Expired contracts
+    if keep_positive_time and "T" in df.columns:
+        df = _drop(df, df["T"].fillna(0) <= 0, "Expired (T ≤ 0)", stats)
+
+    # 2. Near-zero mid price
+    if "mid_price" in df.columns:
+        df = _drop(df, df["mid_price"].fillna(0) <= min_mid_price, f"Mid price ≤ {min_mid_price}", stats)
+
+    # 3. Bid-ask spread too wide
+    if "rel_spread" in df.columns:
+        df = _drop(df, df["rel_spread"].fillna(np.inf) >= spread_limit, f"Rel. spread ≥ {spread_limit:.0%}", stats)
+
+    # 4. Moneyness outside band (keeps near-ATM contracts only)
+    if "moneyness" in df.columns:
+        out_of_band = (df["moneyness"].fillna(0) < moneyness_lo) | (df["moneyness"].fillna(np.inf) > moneyness_hi)
+        df = _drop(df, out_of_band, f"Moneyness outside [{moneyness_lo}, {moneyness_hi}]", stats)
+
+    # 5. No-arbitrage lower bound
+    if {"spot", "strike", "T", "type", "mid_price"}.issubset(df.columns):
+        forward = df["spot"] * np.exp(-q * df["T"])
+        disc_k = df["strike"] * np.exp(-r * df["T"])
+        lower = pd.Series(0.0, index=df.index)
+        calls = df["type"] == "call"
+        puts = df["type"] == "put"
+        lower[calls] = np.maximum(0.0, forward[calls] - disc_k[calls])
+        lower[puts] = np.maximum(0.0, disc_k[puts] - forward[puts])
+        df = _drop(df, df["mid_price"] < lower - 1e-8, "Arbitrage violation", stats)
+
+    # 6. Ticker selection
+    if tickers and "ticker" in df.columns:
+        df = _drop(df, ~df["ticker"].isin(tickers), "Ticker not in selection", stats)
+
+    # 7. Option type selection
+    if option_types and "type" in df.columns:
+        normalized_types = {str(t).lower() for t in option_types}
+        df = _drop(df, ~df["type"].isin(normalized_types), "Option type excluded", stats)
+
+    # 8. Minimum volume
+    if "volume" in df.columns and min_volume > 0:
+        df = _drop(df, df["volume"].fillna(0) < min_volume, f"Volume < {min_volume}", stats)
+
+    # 9. Minimum open interest
+    if "openInterest" in df.columns and min_open_interest > 0:
+        df = _drop(df, df["openInterest"].fillna(0) < min_open_interest, f"Open interest < {min_open_interest}", stats)
+
+    # 10. Max time to maturity
+    if max_maturity is not None and "T" in df.columns:
+        df = _drop(df, df["T"] > max_maturity, f"Maturity > {max_maturity}y", stats)
+
+    # 11. Hard contract cap (applied last, after sort)
+    df = df.sort_values(["ticker", "T", "strike", "type"]).reset_index(drop=True)
+    if max_contracts is not None and len(df) > max_contracts:
+        stats[f"Truncated to max {max_contracts} contracts"] = len(df) - max_contracts
+        df = df.head(max_contracts).copy()
+
+    return df, stats

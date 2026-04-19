@@ -37,6 +37,7 @@ def ensure_option_frame(options_df: pd.DataFrame) -> pd.DataFrame:
 
     if df.empty:
         return df
+    print(df.columns)
 
     for column in NUMERIC_OPTION_COLUMNS:
         if column in df.columns:
@@ -77,8 +78,8 @@ def ensure_option_frame(options_df: pd.DataFrame) -> pd.DataFrame:
 
     if {"spot", "strike"}.issubset(df.columns):
         with np.errstate(divide="ignore", invalid="ignore"):
-            df["moneyness"] = df["spot"] / df["strike"]
-            df["strike_over_spot"] = df["strike"] / df["spot"]
+            df["moneyness"] = df["strike"] / df["spot"]
+            df["spot_over_strike"] = df["spot"] / df["strike"]
             df["atm_distance"] = np.abs(np.log(df["moneyness"]))
 
     if "contractSymbol" not in df.columns:
@@ -99,6 +100,7 @@ def ensure_option_frame(options_df: pd.DataFrame) -> pd.DataFrame:
     df["contract_id"] = df["contractSymbol"].astype(str)
 
     df = df.replace([np.inf, -np.inf], np.nan)
+    print(df.columns)
     return df
 
 
