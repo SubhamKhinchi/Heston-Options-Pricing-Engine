@@ -5,7 +5,6 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-
 NUMERIC_OPTION_COLUMNS: tuple[str, ...] = (
     "spot",
     "strike",
@@ -29,9 +28,6 @@ def _year_fraction_from_maturity(series: pd.Series) -> pd.Series:
 def ensure_option_frame(options_df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize option-chain columns into a consistent, analytics-friendly schema.
-
-    The user-facing canonical moneyness is `spot / strike`. The original
-    `strike / spot` ratio is kept separately as `strike_over_spot`.
     """
     df = options_df.copy()
 
@@ -100,7 +96,7 @@ def ensure_option_frame(options_df: pd.DataFrame) -> pd.DataFrame:
     df["contract_id"] = df["contractSymbol"].astype(str)
 
     df = df.replace([np.inf, -np.inf], np.nan)
-    print(df.columns)
+    #print(df.columns)
     return df
 
 
