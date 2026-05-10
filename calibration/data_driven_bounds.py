@@ -122,7 +122,7 @@ def _estimate_smile_shape(
         return float(np.nanmedian(iv)), 0.0, 0.01
 
     a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
-    return sub, a, b, c
+    return a, b, c
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
