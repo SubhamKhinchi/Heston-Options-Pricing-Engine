@@ -2,7 +2,18 @@ import numpy as np
 from scipy.optimize import minimize
 from calibration.heston_loss_function import heston_loss
 
-def calibrate_heston(r, q, option_df, Ns, Nv, Nt, initial_guess, bounds=None):
+def calibrate_heston(
+    r,
+    q,
+    option_df,
+    Ns,
+    Nv,
+    Nt,
+    initial_guess,
+    bounds=None,
+    objective="iv",
+    pricing_mode="auto",
+):
     if bounds is None:
         bounds=[(1e-4, 2), #v0
                 (1e-4, 10), #kappa
@@ -13,7 +24,7 @@ def calibrate_heston(r, q, option_df, Ns, Nv, Nt, initial_guess, bounds=None):
     result = minimize(
         heston_loss, 
         x0=initial_guess, 
-        args=(r, q, option_df, Ns, Nv, Nt),
+        args=(r, q, option_df, Ns, Nv, Nt, objective, pricing_mode),
         bounds = bounds,
         method='L-BFGS-B'
     )

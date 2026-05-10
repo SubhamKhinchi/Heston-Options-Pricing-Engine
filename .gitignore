@@ -14,3 +14,10 @@ ENV/
 
 # OS generated files
 .DS_Store
+
+DOCS.md
+PLAN.md
+CLAUDE.md
+
+*.json
+*.xlsx

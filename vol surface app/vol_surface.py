@@ -1,73 +1,45 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APP_ROOT = PROJECT_ROOT / "app"
+for path in (PROJECT_ROOT, APP_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
 import streamlit as st
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-from scipy.interpolate import griddata
 
-st.title("Heston Volatility Surface Analyzer")
+from shared import configure_page, load_app_data, render_surface_chart
 
-# -----------------------
-# Sidebar Controls
-# -----------------------
-surface_type = st.sidebar.selectbox(
-    "Select Surface",
-    ["Market IV", "Model IV", "Error Surface"]
-)
 
-# -----------------------
-# Load your precomputed dataframe
-# -----------------------
-df = options_df_nvda_vol.copy()
+configure_page("Vol Surface Explorer")
+st.title("Volatility Surface Explorer")
+st.caption("Standalone compatibility view backed by the new analytics and app service layer.")
 
-df = df.dropna(subset=["market_iv", "model_iv", "moneyness", "T"])
+try:
+    config, raw_df, filtered_df, analytics_df, calibration_meta, calibration_df = load_app_data("legacy_surface")
+except Exception as exc:
+    st.error(f"Failed to load surface data: {exc}")
+    st.stop()
 
-# -----------------------
-# Select Z
-# -----------------------
-X = df["moneyness"].values
-Y = df["T"].values
+surface_columns = [
+    column
+    for column in ("market_iv", "model_iv", "iv_error", "market_delta", "market_gamma", "market_vega")
+    if column in analytics_df.columns and analytics_df[column].notna().any()
+]
 
-if surface_type == "Market IV":
-    Z = df["market_iv"].values
-elif surface_type == "Model IV":
-    Z = df["model_iv"].values
-else:
-    Z = (df["model_iv"] - df["market_iv"]).values
+x_col = st.selectbox("X axis", options=["moneyness", "strike", "market_abs_delta"], index=0)
+z_col = st.selectbox("Surface metric", options=surface_columns, index=0)
 
-# -----------------------
-# Grid interpolation
-# -----------------------
-x_grid = np.linspace(X.min(), X.max(), 50)
-y_grid = np.linspace(Y.min(), Y.max(), 50)
-
-X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
-
-Z_grid = griddata((X, Y), Z, (X_grid, Y_grid), method="cubic")
-
-# Fill NaNs
-Z_grid_nearest = griddata((X, Y), Z, (X_grid, Y_grid), method="nearest")
-Z_grid = np.where(np.isnan(Z_grid), Z_grid_nearest, Z_grid)
-
-# -----------------------
-# Plot
-# -----------------------
-fig = go.Figure(
-    data=[go.Surface(
-        x=X_grid,
-        y=Y_grid,
-        z=Z_grid,
-        colorscale="Jet"
-    )]
-)
-
-fig.update_layout(
-    title=surface_type,
-    scene=dict(
-        xaxis_title="Moneyness (S/K)",
-        yaxis_title="Time to Maturity",
-        zaxis_title="Volatility"
-    ),
-    height=800
-)
-
-st.plotly_chart(fig)
+try:
+    render_surface_chart(
+        analytics_df,
+        x_col=x_col,
+        y_col="T",
+        z_col=z_col,
+        title=f"{z_col} surface",
+    )
+except Exception as exc:
+    st.warning(f"Unable to build the selected surface: {exc}")
