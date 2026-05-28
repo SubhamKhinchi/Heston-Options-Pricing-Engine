@@ -15,10 +15,21 @@ def _year_fraction(maturity: str) -> float:
         return float("nan")
 
 
+def _fetch_dividend_yield(tk: yf.Ticker) -> float:
+    """Return annualised continuous dividend yield from yfinance info, or 0.0 on failure."""
+    try:
+        info = tk.info
+        raw = info.get("dividendYield") or info.get("trailingAnnualDividendYield") or 0.0
+        return float(raw)
+    except Exception:
+        return 0.0
+
+
 def get_all_options(ticker: str) -> pd.DataFrame:
     """Fetch raw option chain from Yahoo Finance. No filtering applied — returns every contract as-is."""
     tk = yf.Ticker(ticker)
     spot = tk.history(period="1d")["Close"].iloc[-1]
+    div_yield = _fetch_dividend_yield(tk)
     frames = []
 
     for maturity in tk.options:
@@ -35,6 +46,7 @@ def get_all_options(ticker: str) -> pd.DataFrame:
         df["maturity"] = maturity
         df["spot"] = spot
         df["ticker"] = ticker
+        df["dividend_yield"] = div_yield
         df["ExerciseStyle"] = "american"
         df["T"] = T
 
@@ -46,8 +58,22 @@ def get_all_options(ticker: str) -> pd.DataFrame:
         elif "lastPrice" in df.columns:
             df["mid_price"] = df["lastPrice"]
 
+        # When bid=0 and ask=0 (no live quote), fall back to lastPrice so the
+        # contract isn't dropped by the mid-price filter outside market hours.
+        if "lastPrice" in df.columns and "mid_price" in df.columns:
+            no_quote = df["mid_price"].fillna(0) <= 0
+            df.loc[no_quote, "mid_price"] = df.loc[no_quote, "lastPrice"]
+
         if {"bid", "ask", "mid_price"}.issubset(df.columns):
-            df["rel_spread"] = (df["ask"] - df["bid"]) / df["mid_price"].replace(0, np.nan)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                spread = (df["ask"] - df["bid"]) / df["mid_price"].replace(0, np.nan)
+            # rel_spread is NaN when bid=ask=0 (no live quote) — spread filter
+            # will skip these rather than treating them as infinitely wide.
+            df["rel_spread"] = np.where(
+                (df["bid"].fillna(0) == 0) & (df["ask"].fillna(0) == 0),
+                np.nan,
+                spread,
+            )
 
         if {"strike", "spot"}.issubset(df.columns):
             df["moneyness"] = df["strike"] / df["spot"]

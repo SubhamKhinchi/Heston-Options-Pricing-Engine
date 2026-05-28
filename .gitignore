@@ -21,3 +21,6 @@ CLAUDE.md
 
 *.json
 *.xlsx
+
+# Archived pages (old UI — kept for local reference, not tracked in git)
+app/pages/_archived_pages/

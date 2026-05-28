@@ -4,6 +4,15 @@ import numpy as np
 import pandas as pd
 
 
+def _interpolate_rate(rate_curve: dict[float, float], T: float) -> float:
+    if not rate_curve:
+        return 0.0
+    maturities = sorted(rate_curve)
+    rates = [rate_curve[t] for t in maturities]
+    rT = np.interp(T, maturities, [r * t for r, t in zip(rates, maturities)])
+    return float(rT / T) if T > 0 else rates[0]
+
+
 def _drop(df: pd.DataFrame, mask: pd.Series, reason: str, stats: dict[str, int]) -> pd.DataFrame:
     n = int(mask.sum())
     if n:
@@ -15,11 +24,12 @@ def apply_filters(
     df: pd.DataFrame,
     *,
     spread_limit: float = 0.05,
-    r: float = 0.05,
+    r: float = 0.0,
     q: float = 0.0,
+    rate_curve: dict[float, float] | None = None,
     min_mid_price: float = 1e-3,
-    moneyness_lo: float = 0.8,
-    moneyness_hi: float = 1.2,
+    moneyness_lo: float = 0.1,
+    moneyness_hi: float = 5.0,
     tickers: list[str] | None = None,
     option_types: tuple[str, ...] | None = None,
     min_volume: int = 0,
@@ -39,19 +49,27 @@ def apply_filters(
     if "mid_price" in df.columns:
         df = _drop(df, df["mid_price"].fillna(0) <= min_mid_price, f"Mid price ≤ {min_mid_price}", stats)
 
-    # 3. Bid-ask spread too wide
+    # 3. Bid-ask spread too wide — only drop contracts with a KNOWN wide spread.
+    #    NaN rel_spread means bid=ask=0 (no live quote, price from lastPrice);
+    #    these are kept here and may be dropped later by volume/OI filters.
     if "rel_spread" in df.columns:
-        df = _drop(df, df["rel_spread"].fillna(np.inf) >= spread_limit, f"Rel. spread ≥ {spread_limit:.0%}", stats)
+        known_wide = df["rel_spread"].notna() & (df["rel_spread"] >= spread_limit)
+        df = _drop(df, known_wide, f"Rel. spread ≥ {spread_limit:.0%}", stats)
 
     # 4. Moneyness outside band (keeps near-ATM contracts only)
     if "moneyness" in df.columns:
         out_of_band = (df["moneyness"].fillna(0) < moneyness_lo) | (df["moneyness"].fillna(np.inf) > moneyness_hi)
         df = _drop(df, out_of_band, f"Moneyness outside [{moneyness_lo}, {moneyness_hi}]", stats)
 
-    # 5. No-arbitrage lower bound
+    # 5. No-arbitrage lower bound (uses maturity-matched rate/yield when columns present)
     if {"spot", "strike", "T", "type", "mid_price"}.issubset(df.columns):
-        forward = df["spot"] * np.exp(-q * df["T"])
-        disc_k = df["strike"] * np.exp(-r * df["T"])
+        if rate_curve:
+            r_vec = df["T"].map(lambda T: _interpolate_rate(rate_curve, T))
+        else:
+            r_vec = pd.Series(r, index=df.index)
+        q_vec = df["q"] if "q" in df.columns else pd.Series(q, index=df.index)
+        forward = df["spot"] * np.exp(-q_vec * df["T"])
+        disc_k = df["strike"] * np.exp(-r_vec * df["T"])
         lower = pd.Series(0.0, index=df.index)
         calls = df["type"] == "call"
         puts = df["type"] == "put"

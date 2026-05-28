@@ -8,6 +8,7 @@ import pandas as pd
 from analytics.greeks import black_scholes_greeks
 from analytics.schema import ensure_option_frame
 from calibration.implied_vol import implied_volatility
+from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters, price_option_frame
 
 
@@ -22,10 +23,10 @@ def _implied_vol_for_row(row: pd.Series, price_col: str, r: float, q: float) -> 
         heston_model_price=price,
         S=row.get("spot"),
         K=row.get("strike"),
-        r=r,
+        r=float(row.get("r", r)),
         T=row.get("T"),
         option_type=row.get("type", ""),
-        q=q,
+        q=float(row.get("q", q)),
     )
 
 
@@ -39,11 +40,11 @@ def _greeks_from_iv(
     greeks = black_scholes_greeks(
         S=row.get("spot"),
         K=row.get("strike"),
-        r=r,
+        r=float(row.get("r", r)),
         T=row.get("T"),
         sigma=row.get(iv_col),
         option_type=row.get("type", ""),
-        q=q,
+        q=float(row.get("q", q)),
     )
     return pd.Series({f"{prefix}_{name}": value for name, value in greeks.items()})
 
@@ -82,9 +83,10 @@ def _intrinsic_value(options_df: pd.DataFrame) -> pd.Series:
 
 def enrich_option_chain(
     options_df: pd.DataFrame,
-    r: float,
-    q: float,
+    r: float = 0.0,
+    q: float = 0.0,
     *,
+    rate_curve: dict | None = None,
     heston_params: HestonParameters | Iterable[float] | None = None,
     compute_model_prices: bool = False,
     pricing_limit: int | None = None,
@@ -101,6 +103,8 @@ def enrich_option_chain(
         return df
 
     df = df.copy()
+    if rate_curve and "r" not in df.columns:
+        df["r"] = df["T"].map(lambda T: interpolate_rate(rate_curve, T))
     df["intrinsic_value"] = _intrinsic_value(df)
     df["time_value"] = df["mid_price"] - df["intrinsic_value"]
     df["liquidity_score"] = compute_liquidity_score(df)
@@ -129,6 +133,7 @@ def enrich_option_chain(
             r=r,
             q=q,
             heston_params=heston_params,
+            rate_curve=rate_curve,
             pricing_limit=pricing_limit,
             Ns=Ns,
             Nv=Nv,

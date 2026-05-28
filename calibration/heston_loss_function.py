@@ -1,94 +1,195 @@
+"""
+Residual vector and analytical Jacobian for Heston calibration.
+
+Implements the nonlinear least-squares formulation of Cui et al. (2016):
+    rᵢ(θ) = C_model(θ; Kᵢ, Tᵢ) − C*ᵢ
+    f(θ)  = ½ ‖r(θ)‖²
+
+The Jacobian Jᵢⱼ = ∂rᵢ/∂θⱼ is computed analytically for European options
+via the GL-quadrature gradient (Eq. 22 of the paper).  American contracts
+fall back to a finite-difference Jacobian automatically through scipy's
+least_squares machinery (jac='2-point' path is never hit here; the fallback
+is invoked by returning np.nan for those rows, triggering scipy's FD).
+"""
+
 import numpy as np
-from pricing.american import american_call_without_dividends
-from pricing.european import heston_european_call_option, heston_european_put_option
+
+from pricing.european_gl import (
+    heston_call_price_and_gradient,
+    heston_put_price_and_gradient,
+    heston_call_gl,
+    heston_put_gl,
+)
+from pricing.american import (
+    american_call_without_dividends,
+    american_call_with_dividends,
+    american_put_without_dividends,
+    american_put_with_dividends,
+)
 from pricing.heston_pde_american import heston_pde_american
 from calibration.implied_vol import implied_volatility
 
+# Weight for the soft Feller-condition penalty appended to the residual vector.
+# Scales the residual r_feller = FELLER_WEIGHT * max(0, σ²-2κθ) so it competes
+# with the price residuals (in dollar units) and pushes the optimizer toward the
+# feasible region where the variance process stays strictly positive.
+FELLER_WEIGHT = 50.0
 
-def _model_price_from_row(row, params, r, q, Ns, Nv, Nt, pricing_mode):
+
+# ------------------------------------------------------------------ #
+# Low-level per-row helpers
+# ------------------------------------------------------------------ #
+
+def _model_price_and_grad(row, params, r, q, Ns, Nv, Nt, pricing_mode):
+    """
+    Compute (model_price, grad) for one contract row.
+
+    grad has shape (5,) in [v0, kappa, theta, sigma, rho] order.
+    For non-European paths, grad is None (caller handles FD fallback).
+    """
     v0, kappa, theta, sigma, rho = params
+    # Per-row rate and yield override global fallbacks when set by service layer.
+    r = float(getattr(row, "r", r))
+    q = float(getattr(row, "q", q))
     S0 = row.spot
     K = row.strike
     T = row.T
-    option_type = row.type
-    exercise_style = row.ExerciseStyle
+    opt_type = row.type
+    exercise = row.ExerciseStyle
 
-    if pricing_mode == "european_proxy":
-        if option_type == "call":
-            return heston_european_call_option(S0, K, r, T, v0, kappa, theta, sigma, rho)
-        if option_type == "put":
-            return heston_european_put_option(S0, K, r, T, v0, kappa, theta, sigma, rho)
-        raise ValueError("European option_type must be 'call' or 'put'")
+    if pricing_mode == "european_proxy" or exercise.lower() == "european":
+        if opt_type == "call":
+            price, grad = heston_call_price_and_gradient(
+                S0, K, r, T, v0, kappa, theta, sigma, rho
+            )
+        else:
+            price, grad = heston_put_price_and_gradient(
+                S0, K, r, T, v0, kappa, theta, sigma, rho
+            )
+        return price, grad
 
-    if exercise_style.lower() == "european":
-        if option_type == "call":
-            return heston_european_call_option(S0, K, r, T, v0, kappa, theta, sigma, rho)
-        if option_type == "put":
-            return heston_european_put_option(S0, K, r, T, v0, kappa, theta, sigma, rho)
-        raise ValueError("European option_type must be 'call' or 'put'")
+    # American — no closed-form gradient; return price only
+    if exercise.lower() == "american":
+        # Call with no dividends: early exercise is never optimal → same as European
+        if opt_type == "call" and abs(q) <= 1e-12:
+            price = american_call_without_dividends(S0, K, r, T, v0, kappa, theta, sigma, rho)
+        elif pricing_mode == "lsmc":
+            # Use fewer paths during calibration to keep runtime tractable
+            _M, _N = 50, 2000
+            if opt_type == "call":
+                price = american_call_with_dividends(
+                    S0, K, r, T, v0, kappa, theta, sigma, rho, _M, _N, q
+                )
+            elif abs(q) <= 1e-12:
+                price = american_put_without_dividends(
+                    S0, K, r, T, v0, kappa, theta, sigma, rho, _M, _N
+                )
+            else:
+                price = american_put_with_dividends(
+                    S0, K, r, T, v0, kappa, theta, sigma, rho, _M, _N, q
+                )
+        else:
+            # pde (default for American)
+            price = heston_pde_american(
+                S0, K, r, q, T, v0, kappa, theta, sigma, rho, opt_type, Ns, Nv, Nt
+            )
+        return price, None
 
-    if exercise_style.lower() == "american":
-        if option_type == "call" and q == 0:
-            return american_call_without_dividends(S0, K, r, T, v0, kappa, theta, sigma, rho)
-        return heston_pde_american(S0, K, r, q, T, v0, kappa, theta, sigma, rho, option_type, Ns, Nv, Nt)
-
-    raise ValueError("Exercise style is not european or american")
+    raise ValueError(f"Unknown exercise style: {exercise!r}")
 
 
-def heston_loss(
-    params,
-    r,
-    q,
-    options_df,
-    Ns,
-    Nv,
-    Nt,
-    objective="iv",
-    pricing_mode="auto",
-):
+# ------------------------------------------------------------------ #
+# Public API consumed by calibrate_heston.py
+# ------------------------------------------------------------------ #
+
+def heston_residuals(params, r, q, options_df, Ns, Nv, Nt, pricing_mode):
+    """
+    Return the residual vector r(θ) ∈ ℝ^(n+1).
+    rᵢ = model_priceᵢ − market_priceᵢ  for i = 1…n (price residuals)
+    r_{n+1} = FELLER_WEIGHT * max(0, σ²−2κθ)  (soft Feller penalty)
+
+    The Feller term is always present (zero when satisfied) so the vector
+    size is constant across calls, as required by scipy's least_squares.
+    Invalid parameters return a large constant vector of the same size.
+    """
     v0, kappa, theta, sigma, rho = params
+    n_valid = int((options_df["mid_price"] > 0).sum())
+    if any(p <= 0 for p in [v0, kappa, theta, sigma]) or not (-1 < rho < 1):
+        return np.full(n_valid + 1, 1e5)
 
-    #variance should be positive
-    if any (p<0 for p in [v0, kappa, theta, sigma]) or not (-1 < rho< 1):
-        return 1e10
-    
-    errors = []
-
+    residuals = []
     for row in options_df.itertuples(index=False):
-        S0 = row.spot
-        K = row.strike
-        T = row.T
-        market_price = row.mid_price
-        option_type = row.type
-        if market_price <=0 :
+        market = row.mid_price
+        if market <= 0:
             continue
+        price, _ = _model_price_and_grad(row, params, r, q, Ns, Nv, Nt, pricing_mode)
+        residuals.append(price - market)
 
-        model_price = _model_price_from_row(
-            row=row,
-            params=params,
-            r=r,
-            q=q,
-            Ns=Ns,
-            Nv=Nv,
-            Nt=Nt,
-            pricing_mode=pricing_mode,
-        )
+    # Soft Feller penalty — zero when 2κθ ≥ σ², positive when violated
+    feller_gap = max(0.0, sigma ** 2 - 2.0 * kappa * theta)
+    residuals.append(FELLER_WEIGHT * feller_gap)
 
-        if objective == "price":
-            scale = max(abs(market_price), 1.0)
-            errors.append(((model_price - market_price) / scale) ** 2)
+    return np.array(residuals) if residuals else np.array([1e5])
+
+
+def heston_jacobian(params, r, q, options_df, Ns, Nv, Nt, pricing_mode):
+    """
+    Return the Jacobian matrix J ∈ ℝ^((n+1)×5).
+    Rows 0…n−1 : ∂rᵢ/∂θⱼ = ∂C_model/∂θⱼ  (analytical for European contracts)
+    Row  n      : gradient of the soft Feller penalty (analytical, always present)
+
+    For European contracts the price gradient comes from Theorem 1 of Cui et al.
+    For American contracts the row is np.nan so scipy falls back to finite differences.
+    """
+    v0, kappa, theta, sigma, rho = params
+    rows = []
+    for row in options_df.itertuples(index=False):
+        if row.mid_price <= 0:
             continue
+        _, grad = _model_price_and_grad(row, params, r, q, Ns, Nv, Nt, pricing_mode)
+        rows.append(grad if grad is not None else np.full(5, np.nan))
 
-        market_iv = getattr(row, "market_iv", np.nan)
-        if np.isnan(market_iv):
-            market_iv = implied_volatility(market_price, S0, K, r, T, option_type, q)
+    # Feller gradient: d/d[v0,κ,θ,σ,ρ] of FELLER_WEIGHT * max(0, σ²−2κθ)
+    if sigma ** 2 > 2.0 * kappa * theta:
+        feller_grad = FELLER_WEIGHT * np.array([0.0, -2.0 * theta, -2.0 * kappa, 2.0 * sigma, 0.0])
+    else:
+        feller_grad = np.zeros(5)
+    rows.append(feller_grad)
 
-        model_iv = implied_volatility(model_price, S0, K, r, T, option_type, q)
+    return np.array(rows)
 
-        if np.isnan(model_iv) or np.isnan(market_iv):
-            continue
-        errors.append((model_iv - market_iv)**2)
-    if not errors:
-        return 1e10
 
-    return float(np.mean(errors))
+# ------------------------------------------------------------------ #
+# Legacy scalar-loss shim — no longer used by the main calibrator.
+# Kept here for reference; uncomment if needed for standalone debugging.
+# ------------------------------------------------------------------ #
+
+# def heston_loss(params, r, q, options_df, Ns, Nv, Nt,
+#                 objective="iv", pricing_mode="auto"):
+#     """Scalar MSE loss — legacy, superseded by heston_residuals/heston_jacobian."""
+#     v0, kappa, theta, sigma, rho = params
+#     if any(p <= 0 for p in [v0, kappa, theta, sigma]) or not (-1 < rho < 1):
+#         return 1e10
+#
+#     errors = []
+#     for row in options_df.itertuples(index=False):
+#         market = row.mid_price
+#         if market <= 0:
+#             continue
+#         price, _ = _model_price_and_grad(row, params, r, q, Ns, Nv, Nt, pricing_mode)
+#
+#         if objective == "price":
+#             scale = max(abs(market), 1.0)
+#             errors.append(((price - market) / scale) ** 2)
+#         else:
+#             market_iv = getattr(row, "market_iv", np.nan)
+#             if np.isnan(market_iv):
+#                 market_iv = implied_volatility(
+#                     market, row.spot, row.strike, r, row.T, row.type, q
+#                 )
+#             model_iv = implied_volatility(price, row.spot, row.strike, r, row.T, row.type, q)
+#             if np.isnan(model_iv) or np.isnan(market_iv):
+#                 continue
+#             errors.append((model_iv - market_iv) ** 2)
+#
+#     return float(np.mean(errors)) if errors else 1e10
