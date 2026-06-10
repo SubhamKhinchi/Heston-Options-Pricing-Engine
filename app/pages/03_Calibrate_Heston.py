@@ -12,7 +12,8 @@ for path in (PROJECT_ROOT, APP_ROOT):
 import pandas as pd
 import streamlit as st
 
-from services.calibration_service import calibrate_option_chain
+from calibration.data_driven_bounds import compute_data_driven_bounds
+from services.calibration_service import calibrate_option_chain, _loosen_data_driven_bounds
 from services.market_service import parse_tickers
 from services.pricing_service import HestonParameters
 
@@ -39,7 +40,6 @@ if "filtered_df" not in ss:
 
 filtered_df: pd.DataFrame = ss["filtered_df"]
 params: dict = ss.get("fetch_params", {})
-div_yields: dict = ss.get("_div_yields", {})
 rate_curve: dict = ss.get("rate_curve", {})
 r = ss.get("r_scalar", params.get("r", 0.045))
 q = params.get("q", 0.0)
@@ -61,10 +61,9 @@ if filtered_df.empty:
 for tkr in parse_tickers(params.get("tickers", "NVDA")):
     tkr_df = filtered_df[filtered_df["ticker"] == tkr] if "ticker" in filtered_df.columns else filtered_df
     spot = tkr_df["spot"].iloc[0] if not tkr_df.empty and "spot" in tkr_df.columns else None
-    q_val = div_yields.get(tkr, q)
     st.caption(
         f"**{tkr}**: spot {'${:.2f}'.format(spot) if spot else 'n/a'}  |  "
-        f"r = {r*100:.3f}%  |  q = {q_val*100:.3f}%  |  "
+        f"r = {r*100:.3f}%  |  carry via implied forward F(T)  |  "
         f"{len(tkr_df):,} filtered contracts"
     )
 
@@ -87,25 +86,124 @@ with sh_col2:
 max_exp = int(max_expiries) if max_expiries > 0 else None
 cpe = int(contracts_per_expiry) if contracts_per_expiry > 0 else None
 
-_DEFAULT_GUESS = "0.04, 2.0, 0.04, 0.5, -0.7"
+# Parameter metadata and the global feasible box (mirrors calibrate_heston._DEFAULT_BOUNDS).
+_PARAM_META = [
+    ("v₀", "init variance"),
+    ("κ",  "mean-reversion speed"),
+    ("θ̄",  "long-run variance"),
+    ("σ",  "vol of vol"),
+    ("ρ",  "spot-vol correlation"),
+]
+_GLOBAL_LB = [1e-4, 1e-4, 1e-4, 1e-4, -0.999]
+_GLOBAL_UB = [2.0, 10.0, 2.0, 3.0, 0.999]
 
-def _parse_guess(text: str) -> HestonParameters:
-    vals = [float(x.strip()) for x in text.split(",")]
-    if len(vals) != 5:
-        raise ValueError("Expected 5 comma-separated values: v0, kappa, theta, sigma, rho")
-    return HestonParameters.from_iterable(vals)
 
-def _run_calibration(method_code: str, guess: HestonParameters, Ns: int, Nv: int, Nt: int):
+def _params_from_editor(edited_df: pd.DataFrame) -> tuple[HestonParameters, list[tuple[float, float]]]:
+    """Read the shared editable table into an initial guess + bounds list.
+
+    Clamps each row to the global feasible box and enforces lower ≤ guess ≤ upper.
+    """
+    guess_vals: list[float] = []
+    bounds_list: list[tuple[float, float]] = []
+    for i in range(5):
+        g = float(edited_df["Initial guess"].iloc[i])
+        lo = max(float(edited_df["Lower bound"].iloc[i]), _GLOBAL_LB[i])
+        hi = min(float(edited_df["Upper bound"].iloc[i]), _GLOBAL_UB[i])
+        if lo > hi:
+            lo, hi = hi, lo
+        g = min(max(g, lo), hi)
+        guess_vals.append(g)
+        bounds_list.append((lo, hi))
+    return HestonParameters.from_iterable(guess_vals), bounds_list
+
+
+def _run_calibration(
+    method_code: str,
+    guess: HestonParameters,
+    bounds: list[tuple[float, float]],
+    Ns: int, Nv: int, Nt: int,
+):
     return calibrate_option_chain(
         filtered_df,
         r=r, q=q,
         rate_curve=rate_curve,
         initial_guess=guess,
+        bounds=bounds,
         Ns=Ns, Nv=Nv, Nt=Nt,
         max_expiries=max_exp,
         contracts_per_expiry=cpe,
         american_method=method_code,
     )
+
+
+# ── Data-driven initial parameters & bounds (shared across all methods) ────────
+st.divider()
+st.subheader("Initial parameters & search bounds")
+st.caption(
+    "Estimate the five Heston parameters and their search bounds directly from the "
+    "shape of the market IV surface (ATM level, term structure, smile slope & "
+    "curvature). These are **shared across all three methods** — edit any value "
+    "before calibrating."
+)
+
+if st.button("📊 Estimate data-driven parameters", type="secondary"):
+    try:
+        dd = compute_data_driven_bounds(filtered_df, r=r, q=q)
+    except Exception as e:
+        st.error(f"Estimation failed: {e}")
+    else:
+        ss["dd_estimate"] = dd
+        ss["dd_version"] = ss.get("dd_version", 0) + 1
+        st.rerun()
+
+if "dd_estimate" not in ss:
+    st.info("Click **Estimate data-driven parameters** to read a starting point from the surface.")
+    st.stop()
+
+_dd = ss["dd_estimate"]
+_ig = _dd["initial_guess"]
+_diag = _dd["diagnostics"]
+# Loosen the raw per-chain bounds the same way the optimizer would (widen the
+# σ ceiling and ρ window) so the defaults shown here are not pre-capped.
+_bnds = (
+    _loosen_data_driven_bounds(_dd["bounds"])
+    if "warning" not in _diag else _dd["bounds"]
+)
+
+if "warning" in _diag:
+    st.warning(
+        f"Limited data: {_diag['warning']} Showing static defaults — review and edit below."
+    )
+else:
+    st.caption(
+        f"From surface — liquid maturities: {_diag.get('n_liquid_maturities')} "
+        f"(T {_diag.get('T_short', float('nan')):.3f} → {_diag.get('T_long', float('nan')):.3f}) · "
+        f"ATM IV {_diag.get('sigma_atm_short', float('nan'))*100:.1f}% → "
+        f"{_diag.get('sigma_atm_long', float('nan'))*100:.1f}% · "
+        f"smile slope b={_diag.get('smile_slope_b', 0.0):+.3f} · "
+        f"curvature c={_diag.get('smile_curvature_c', 0.0):+.4f}"
+    )
+
+_editor_seed = pd.DataFrame({
+    "Parameter":     [m[0] for m in _PARAM_META],
+    "Initial guess": [round(float(_ig[i]), 4) for i in range(5)],
+    "Lower bound":   [round(float(_bnds[i][0]), 4) for i in range(5)],
+    "Upper bound":   [round(float(_bnds[i][1]), 4) for i in range(5)],
+    "Meaning":       [m[1] for m in _PARAM_META],
+})
+edited_params = st.data_editor(
+    _editor_seed,
+    key=f"param_editor_v{ss.get('dd_version', 0)}",
+    hide_index=True,
+    use_container_width=True,
+    disabled=["Parameter", "Meaning"],
+    column_config={
+        "Initial guess": st.column_config.NumberColumn(format="%.4f", step=0.01),
+        "Lower bound":   st.column_config.NumberColumn(format="%.4f", step=0.01),
+        "Upper bound":   st.column_config.NumberColumn(format="%.4f", step=0.01),
+    },
+)
+shared_guess, shared_bounds = _params_from_editor(edited_params)
 
 def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
     """Render calibration result inside a column."""
@@ -159,31 +257,21 @@ with col_a:
     st.markdown("### European Proxy")
     st.caption("Prices American options as European. Fast — good for initial calibration.")
 
-    guess_a = st.text_input(
-        "Initial guess  (v₀, κ, θ̄, σ, ρ)",
-        value=_DEFAULT_GUESS,
-        key="guess_european_proxy",
-        help="Starting point for the optimiser. Format: v0, kappa, theta, sigma, rho",
-    )
-
     if st.button("Calibrate — European Proxy", type="primary", key="btn_ep"):
-        try:
-            hp = _parse_guess(guess_a)
-        except Exception as e:
-            st.error(f"Invalid initial guess: {e}")
-        else:
-            with st.spinner("Calibrating with European Proxy …"):
-                try:
-                    result, cal_df = _run_calibration("european_proxy", hp, Ns=40, Nv=20, Nt=40)
-                    meta = result.as_dict()
-                    meta["method_label"] = "European Proxy"
-                    if "calibration" not in ss:
-                        ss["calibration"] = {}
-                    ss["calibration"]["european_proxy"] = {"meta": meta, "df": cal_df}
-                    st.success("Done.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Calibration failed: {e}")
+        with st.spinner("Calibrating with European Proxy …"):
+            try:
+                result, cal_df = _run_calibration(
+                    "european_proxy", shared_guess, shared_bounds, Ns=40, Nv=20, Nt=40
+                )
+                meta = result.as_dict()
+                meta["method_label"] = "European Proxy"
+                if "calibration" not in ss:
+                    ss["calibration"] = {}
+                ss["calibration"]["european_proxy"] = {"meta": meta, "df": cal_df}
+                st.success("Done.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Calibration failed: {e}")
 
     if "european_proxy" in cal:
         _render_result(cal["european_proxy"]["meta"], cal["european_proxy"].get("df"))
@@ -195,13 +283,6 @@ with col_b:
     st.markdown("### PDE Solver")
     st.caption("Solves the Heston PDE on a finite-difference grid. Accurate for early-exercise premium.")
 
-    guess_b = st.text_input(
-        "Initial guess  (v₀, κ, θ̄, σ, ρ)",
-        value=_DEFAULT_GUESS,
-        key="guess_pde",
-        help="Starting point for the optimiser.",
-    )
-
     b1, b2, b3 = st.columns(3)
     Ns_pde = b1.number_input("Ns (stock steps)", min_value=5, max_value=200, value=40, step=5, key="Ns_pde",
                               help="Number of stock-price grid points in the PDE.")
@@ -211,25 +292,21 @@ with col_b:
                               help="Number of time steps in the PDE.")
 
     if st.button("Calibrate — PDE Solver", type="primary", key="btn_pde"):
-        try:
-            hp = _parse_guess(guess_b)
-        except Exception as e:
-            st.error(f"Invalid initial guess: {e}")
-        else:
-            with st.spinner("Calibrating with PDE Solver — this may take several minutes …"):
-                try:
-                    result, cal_df = _run_calibration(
-                        "pde", hp, Ns=int(Ns_pde), Nv=int(Nv_pde), Nt=int(Nt_pde)
-                    )
-                    meta = result.as_dict()
-                    meta["method_label"] = "PDE Solver"
-                    if "calibration" not in ss:
-                        ss["calibration"] = {}
-                    ss["calibration"]["pde"] = {"meta": meta, "df": cal_df}
-                    st.success("Done.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Calibration failed: {e}")
+        with st.spinner("Calibrating with PDE Solver — this may take several minutes …"):
+            try:
+                result, cal_df = _run_calibration(
+                    "pde", shared_guess, shared_bounds,
+                    Ns=int(Ns_pde), Nv=int(Nv_pde), Nt=int(Nt_pde)
+                )
+                meta = result.as_dict()
+                meta["method_label"] = "PDE Solver"
+                if "calibration" not in ss:
+                    ss["calibration"] = {}
+                ss["calibration"]["pde"] = {"meta": meta, "df": cal_df}
+                st.success("Done.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Calibration failed: {e}")
 
     if "pde" in cal:
         _render_result(cal["pde"]["meta"], cal["pde"].get("df"))
@@ -241,13 +318,6 @@ with col_c:
     st.markdown("### LSMC Simulation")
     st.caption("Longstaff-Schwartz Monte Carlo. Most flexible; highest variance per run.")
 
-    guess_c = st.text_input(
-        "Initial guess  (v₀, κ, θ̄, σ, ρ)",
-        value=_DEFAULT_GUESS,
-        key="guess_lsmc",
-        help="Starting point for the optimiser.",
-    )
-
     c1, c2 = st.columns(2)
     Ns_lsmc = c1.number_input("Paths (Ns)", min_value=100, max_value=50000, value=1000, step=100,
                                key="Ns_lsmc",
@@ -257,25 +327,20 @@ with col_c:
                                help="Number of time discretisation steps per path.")
 
     if st.button("Calibrate — LSMC", type="primary", key="btn_lsmc"):
-        try:
-            hp = _parse_guess(guess_c)
-        except Exception as e:
-            st.error(f"Invalid initial guess: {e}")
-        else:
-            with st.spinner("Calibrating with LSMC — this may take several minutes …"):
-                try:
-                    result, cal_df = _run_calibration(
-                        "lsmc", hp, Ns=int(Ns_lsmc), Nv=20, Nt=int(Nt_lsmc)
-                    )
-                    meta = result.as_dict()
-                    meta["method_label"] = "LSMC Simulation"
-                    if "calibration" not in ss:
-                        ss["calibration"] = {}
-                    ss["calibration"]["lsmc"] = {"meta": meta, "df": cal_df}
-                    st.success("Done.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Calibration failed: {e}")
+        with st.spinner("Calibrating with LSMC — this may take several minutes …"):
+            try:
+                result, cal_df = _run_calibration(
+                    "lsmc", shared_guess, shared_bounds, Ns=int(Ns_lsmc), Nv=20, Nt=int(Nt_lsmc)
+                )
+                meta = result.as_dict()
+                meta["method_label"] = "LSMC Simulation"
+                if "calibration" not in ss:
+                    ss["calibration"] = {}
+                ss["calibration"]["lsmc"] = {"meta": meta, "df": cal_df}
+                st.success("Done.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Calibration failed: {e}")
 
     if "lsmc" in cal:
         _render_result(cal["lsmc"]["meta"], cal["lsmc"].get("df"))

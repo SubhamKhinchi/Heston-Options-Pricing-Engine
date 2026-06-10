@@ -98,7 +98,17 @@ def _compute_moneyness(df: pd.DataFrame) -> pd.DataFrame:
     with np.errstate(divide="ignore", invalid="ignore"):
         df["moneyness"] = df["strike"] / df["spot"]
         df["spot_over_strike"] = df["spot"] / df["strike"]
-        df["atm_distance"] = np.abs(np.log(df["moneyness"]))
+        # Forward-based moneyness K/F is the economically correct ATM measure.
+        # Use it when an implied forward is available (stamped by market_data);
+        # otherwise fall back to spot-based K/S. atm_distance drives ATM
+        # selection downstream, so it should be forward-based when possible.
+        if "forward" in df.columns and df["forward"].notna().any():
+            fwd = df["forward"].where(df["forward"] > 0)
+            df["forward_moneyness"] = df["strike"] / fwd
+            df["forward_moneyness"] = df["forward_moneyness"].fillna(df["moneyness"])
+            df["atm_distance"] = np.abs(np.log(df["forward_moneyness"]))
+        else:
+            df["atm_distance"] = np.abs(np.log(df["moneyness"]))
     return df
 
 

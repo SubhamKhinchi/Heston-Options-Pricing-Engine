@@ -22,8 +22,10 @@ from calibration.heston_loss_function import heston_residuals, heston_jacobian
 # (Table 5) extended slightly for equity options.
 _DEFAULT_BOUNDS = (
     [1e-4, 1e-4, 1e-4, 1e-4, -0.999],   # lower: [v0, kappa, theta, sigma, rho]
-    [2.0,  10.0, 2.0,  1.0,   0.999],   # upper: σ ≤ 1.0 keeps the CF numerically stable
-)
+    [2.0,  10.0, 2.0,  3.0,   0.999],   # upper: σ ≤ 3.0 — the Cui CF stays numerically
+)                                       # stable well past 1.0, and high-vol single names
+                                        # (NVDA) have vol-of-vol comfortably above 1.0;
+                                        # a 1.0 cap pins σ and contorts κ/θ/ρ.
 
 
 def calibrate_heston(

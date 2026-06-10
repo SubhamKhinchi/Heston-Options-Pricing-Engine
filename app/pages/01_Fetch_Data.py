@@ -94,23 +94,43 @@ if "raw_df" not in ss:
 
 raw_df: pd.DataFrame = ss["raw_df"]
 params: dict = ss["fetch_params"]
-div_yields: dict = ss.get("_div_yields", {})
 
 # ── Per-ticker summary ────────────────────────────────────────────────────────
 st.subheader("Fetched data summary")
 
 tickers_list = parse_tickers(params["tickers"])
 
+def _first(series_df, col, default=None):
+    if col in series_df.columns and not series_df.empty:
+        return series_df[col].iloc[0]
+    return default
+
+
+def _forward_summary(tkr_df: pd.DataFrame) -> str:
+    """How dividends/carry were sourced across this ticker's expiries."""
+    if "dividend_source" not in tkr_df.columns or tkr_df.empty:
+        return "—"
+    per_exp = tkr_df.groupby("maturity")["dividend_source"].first()
+    n_total = len(per_exp)
+    n_implied = int((per_exp == "implied_forward").sum())
+    if n_implied == 0:
+        return "trailing-yield fallback"
+    return f"implied forward ({n_implied}/{n_total} expiries)"
+
+
 ticker_rows = []
 for tkr in tickers_list:
     tkr_df = raw_df[raw_df["ticker"] == tkr] if "ticker" in raw_df.columns else raw_df
     spot = tkr_df["spot"].iloc[0] if not tkr_df.empty and "spot" in tkr_df.columns else None
-    q_val = div_yields.get(tkr, params.get("q", 0.0))
+    inst_type = _first(tkr_df, "instrument_type", "—")
+    exercise = _first(tkr_df, "ExerciseStyle", "—")
     ticker_rows.append({
         "Ticker": tkr,
+        "Type": inst_type,
+        "Exercise": str(exercise).capitalize(),
         "Spot": f"${spot:.2f}" if spot is not None else "n/a",
-        "Div yield (q)": f"{q_val*100:.3f}%",
         "r (risk-free)": f"{params['r']*100:.3f}%",
+        "Carry / dividends": _forward_summary(tkr_df),
         "Contracts": f"{len(tkr_df):,}",
         "Expiries": tkr_df["maturity"].nunique() if not tkr_df.empty else 0,
     })
@@ -118,14 +138,47 @@ for tkr in tickers_list:
 summary_df = pd.DataFrame(ticker_rows)
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-# Small caption line matching user's requested style
-caption_parts = []
-for row in ticker_rows:
-    caption_parts.append(
-        f"**{row['Ticker']}**: spot {row['Spot']}  |  r = {params['r']*100:.3f}%  |  q = {row['Div yield (q)']}"
+st.caption(
+    "Dividends/carry enter pricing through the **implied forward F(T)** recovered "
+    "per expiry from near-ATM put–call parity — not a single scalar dividend yield. "
+    "The implied yield q(T) = r − ln(F/S)/T is shown in the curve below **only as a "
+    "diagnostic**: it is amplified by 1/T and unstable at short maturities, which is "
+    "exactly why the engine carries F(T) rather than q."
+)
+
+# ── Implied forward curve F(T) ────────────────────────────────────────────────
+st.subheader("Implied forward curve  F(T)")
+st.caption(
+    "The forward factor F/S is the actual carry applied at each maturity "
+    "(F/S > 1 ⇒ positive net carry, < 1 ⇒ dividend drag)."
+)
+for tkr in tickers_list:
+    tkr_df = raw_df[raw_df["ticker"] == tkr] if "ticker" in raw_df.columns else raw_df
+    if tkr_df.empty or "forward" not in tkr_df.columns:
+        continue
+    spot = tkr_df["spot"].iloc[0]
+    fc = (
+        tkr_df.groupby("maturity")
+        .agg(
+            T=("T", "first"),
+            forward=("forward", "first"),
+            implied_q=("dividend_yield", "first"),
+            source=("dividend_source", "first"),
+        )
+        .reset_index()
+        .sort_values("T")
     )
-for part in caption_parts:
-    st.caption(part)
+    disp = pd.DataFrame({
+        "Maturity": fc["maturity"],
+        "T (yrs)": fc["T"].round(4),
+        "Forward F(T)": fc["forward"].round(2),
+        "Forward factor F/S": (fc["forward"] / spot).round(4),
+        "Implied q(T) [diagnostic]": (fc["implied_q"] * 100).round(3).map(lambda v: f"{v}%"),
+        "Source": fc["source"].astype(str).str.replace("_", " "),
+    })
+    if len(tickers_list) > 1:
+        st.markdown(f"**{tkr}**")
+    st.dataframe(disp, use_container_width=True, hide_index=True)
 
 # Total contracts metric
 c1, c2 = st.columns(2)
@@ -141,9 +194,10 @@ if "filtered_df" in ss:
 
 # Raw chain table
 st.subheader("Raw option chain")
-_COLS = ["ticker", "type", "maturity", "strike", "spot",
+_COLS = ["ticker", "instrument_type", "ExerciseStyle", "type", "maturity", "strike", "spot",
          "bid", "ask", "mid_price", "lastPrice",
-         "volume", "openInterest", "rel_spread", "T", "moneyness"]
+         "volume", "openInterest", "rel_spread", "T", "moneyness",
+         "forward", "dividend_yield", "dividend_source"]
 show_cols = [c for c in _COLS if c in raw_df.columns]
 st.dataframe(raw_df[show_cols], use_container_width=True, hide_index=True)
 

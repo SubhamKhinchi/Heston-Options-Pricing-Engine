@@ -12,9 +12,34 @@ import pandas as pd
 from analytics.schema import ensure_option_frame
 from calibration.calibrate_heston import calibrate_heston
 from calibration.calibrate_heston_lbfgsb import calibrate_heston_lbfgsb
+from calibration.data_driven_bounds import compute_data_driven_bounds
 from calibration.implied_vol import implied_volatility
 from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters
+
+
+def _loosen_data_driven_bounds(
+    bounds: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """
+    Widen the tight per-chain bounds from compute_data_driven_bounds before
+    handing them to the optimizer.
+
+    The data-driven estimates are a good *centre* for the search, but the
+    underlying short-time smile heuristics (σ≈√(8c), ρ≈2b/σ) are only
+    approximate, so the raw ±0.20 ρ window / [0.5σ*, 2σ*] σ box can trap the
+    optimizer near a biased guess. We keep the data-driven v0/κ/θ boxes (well
+    identified by ATM level and term structure) but loosen the two parameters
+    the heuristics estimate least reliably:
+      • σ: raise the ceiling to at least 3.0 so vol-of-vol is never pre-capped
+      • ρ: widen to a ±0.40 window, clipped to (-0.999, 0.999)
+    """
+    v0_b, kappa_b, theta_b, sigma_b, rho_b = bounds
+    sigma_b = (sigma_b[0], max(sigma_b[1], 3.0))
+    rho_lo = max(rho_b[0] - 0.20, -0.999)
+    rho_hi = min(rho_b[1] + 0.20, 0.999)
+    rho_b = (rho_lo, rho_hi)
+    return [v0_b, kappa_b, theta_b, sigma_b, rho_b]
 
 
 DEFAULT_INITIAL_GUESS = HestonParameters(0.04, 2.0, 0.04, 0.5, -0.7)
@@ -165,6 +190,7 @@ def calibrate_option_chain(
     rate_curve: dict | None = None,
     initial_guess: HestonParameters = DEFAULT_INITIAL_GUESS,
     bounds: list[tuple[float, float]] | None = None,
+    use_data_driven: bool = True,
     Ns: int = 40,
     Nv: int = 20,
     Nt: int = 40,
@@ -201,6 +227,32 @@ def calibrate_option_chain(
         else:
             calibration_df["r"] = r
 
+    # Derive a per-chain initial guess and search bounds from the shape of the
+    # market IV surface, instead of always starting from the static default.
+    # Only when the caller did not supply explicit bounds.
+    ig_list = list(initial_guess.as_tuple())
+    effective_bounds = bounds
+    if use_data_driven and bounds is None:
+        dd = compute_data_driven_bounds(calibration_df, r=r, q=q)
+        warn = dd["diagnostics"].get("warning")
+        if warn:
+            # Not enough liquid maturities/strikes to read the surface —
+            # compute_data_driven_bounds already fell back to static defaults.
+            print(f"[calibration] data-driven bounds unavailable: {warn} "
+                  f"Using static default guess/bounds.")
+        else:
+            effective_bounds = _loosen_data_driven_bounds(dd["bounds"])
+            # Adopt the data-driven guess only if the caller kept the default.
+            if initial_guess == DEFAULT_INITIAL_GUESS:
+                ig_list = dd["initial_guess"]
+            diag = dd["diagnostics"]
+            print(
+                "[calibration] using data-driven guess/bounds "
+                f"({diag.get('n_liquid_maturities')} liquid maturities): "
+                f"v0={ig_list[0]:.4f} kappa={ig_list[1]:.4f} theta={ig_list[2]:.4f} "
+                f"sigma={ig_list[3]:.4f} rho={ig_list[4]:+.4f}"
+            )
+
     start_time = perf_counter()
     params_opt, loss_val = calibrate_heston(
         r=r,
@@ -209,8 +261,8 @@ def calibrate_option_chain(
         Ns=Ns,
         Nv=Nv,
         Nt=Nt,
-        initial_guess=list(initial_guess.as_tuple()),
-        bounds=bounds,
+        initial_guess=ig_list,
+        bounds=effective_bounds,
         objective=objective,
         pricing_mode=pricing_mode,
     )

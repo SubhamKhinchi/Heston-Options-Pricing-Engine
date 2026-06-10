@@ -56,25 +56,35 @@ def apply_filters(
         known_wide = df["rel_spread"].notna() & (df["rel_spread"] >= spread_limit)
         df = _drop(df, known_wide, f"Rel. spread ≥ {spread_limit:.0%}", stats)
 
-    # 4. Moneyness outside band (keeps near-ATM contracts only)
-    if "moneyness" in df.columns:
-        out_of_band = (df["moneyness"].fillna(0) < moneyness_lo) | (df["moneyness"].fillna(np.inf) > moneyness_hi)
+    # 4. Moneyness outside band (keeps near-ATM contracts only). Prefer the
+    #    forward-based measure K/F when available — it is the correct ATM metric;
+    #    K/S is used only as a coarse fallback before any forward is known.
+    moneyness_col = "forward_moneyness" if "forward_moneyness" in df.columns else "moneyness"
+    if moneyness_col in df.columns:
+        m = df[moneyness_col]
+        out_of_band = (m.fillna(0) < moneyness_lo) | (m.fillna(np.inf) > moneyness_hi)
         df = _drop(df, out_of_band, f"Moneyness outside [{moneyness_lo}, {moneyness_hi}]", stats)
 
-    # 5. No-arbitrage lower bound (uses maturity-matched rate/yield when columns present)
+    # 5. No-arbitrage lower bound: e^{-rT}·max(0, F-K) for calls, e^{-rT}·max(0, K-F)
+    #    for puts. Uses the implied forward F directly when present (the carried
+    #    object); else reconstructs it from the per-row yield as S·e^{(r-q)T}.
     if {"spot", "strike", "T", "type", "mid_price"}.issubset(df.columns):
         if rate_curve:
             r_vec = df["T"].map(lambda T: _interpolate_rate(rate_curve, T))
         else:
             r_vec = pd.Series(r, index=df.index)
-        q_vec = df["q"] if "q" in df.columns else pd.Series(q, index=df.index)
-        forward = df["spot"] * np.exp(-q_vec * df["T"])
-        disc_k = df["strike"] * np.exp(-r_vec * df["T"])
+        disc = np.exp(-r_vec * df["T"])
+        if "forward" in df.columns and df["forward"].notna().any():
+            forward_pv = df["forward"].fillna(df["spot"]) * disc      # e^{-rT}·F
+        else:
+            q_vec = df["q"] if "q" in df.columns else pd.Series(q, index=df.index)
+            forward_pv = df["spot"] * np.exp(-q_vec * df["T"])         # = e^{-rT}·F
+        disc_k = df["strike"] * disc
         lower = pd.Series(0.0, index=df.index)
         calls = df["type"] == "call"
         puts = df["type"] == "put"
-        lower[calls] = np.maximum(0.0, forward[calls] - disc_k[calls])
-        lower[puts] = np.maximum(0.0, disc_k[puts] - forward[puts])
+        lower[calls] = np.maximum(0.0, forward_pv[calls] - disc_k[calls])
+        lower[puts] = np.maximum(0.0, disc_k[puts] - forward_pv[puts])
         df = _drop(df, df["mid_price"] < lower - 1e-8, "Arbitrage violation", stats)
 
     # 6. Ticker selection

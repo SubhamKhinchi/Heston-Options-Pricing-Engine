@@ -30,10 +30,19 @@ from pricing.heston_pde_american import heston_pde_american
 from calibration.implied_vol import implied_volatility
 
 # Weight for the soft Feller-condition penalty appended to the residual vector.
-# Scales the residual r_feller = FELLER_WEIGHT * max(0, σ²-2κθ) so it competes
-# with the price residuals (in dollar units) and pushes the optimizer toward the
-# feasible region where the variance process stays strictly positive.
-FELLER_WEIGHT = 50.0
+# Scales the residual r_feller = FELLER_WEIGHT * max(0, σ²-2κθ).
+#
+# DEFAULT 0.0 (penalty OFF). The Feller condition 2κθ ≥ σ² keeps the
+# continuous-time variance process from touching zero, but single-name equities
+# (NVDA especially) routinely violate it — high vol-of-vol relative to mean
+# reversion is the empirical norm. A nonzero weight pins the fit onto the
+# boundary 2κθ = σ², which forces κ artificially high, σ toward its cap, and
+# distorts ρ. A controlled recovery test (synthetic chain priced from known
+# params with σ=1.5 > 2κθ) showed FELLER_WEIGHT=50 could NOT recover the truth
+# (landed on Feller=0 with κ≈5.5), while FELLER_WEIGHT=0 recovered it to machine
+# precision. Set to a small positive value (e.g. 0.1) only if you want a gentle
+# tiebreaker toward feasibility without dominating the price residuals.
+FELLER_WEIGHT = 0.0
 
 
 # ------------------------------------------------------------------ #
