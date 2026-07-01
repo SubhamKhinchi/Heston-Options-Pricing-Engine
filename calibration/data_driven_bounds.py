@@ -129,7 +129,7 @@ def _estimate_smile_shape(
 
 def compute_data_driven_bounds(
     df: pd.DataFrame,
-    r: float = 0.05,
+    r: float = 0.0,
     q: float = 0.0,
     atm_threshold: float = 0.10,
     fit_threshold: float = 0.15,

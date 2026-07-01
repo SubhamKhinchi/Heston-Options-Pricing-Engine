@@ -1,6 +1,13 @@
+"""
+European Black-Scholes price with continuous dividend yield.
+
+The constant-vol BS European formula. Used as the European leg of
+de-Americanization (calibration/de_americanize.py) and as the inversion target
+for implied volatility (calibration/implied_vol.py).
+"""
+
 import numpy as np
 from scipy.stats import norm
-from scipy.optimize import brentq
 
 
 def black_scholes_price(S, K, r, T, sigma, option_type, q):

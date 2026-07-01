@@ -1,3 +1,13 @@
+"""
+Construct strategy legs from analytics rows.
+
+`build_leg_from_row()` turns an enriched option-chain row into an OptionLeg
+(strategies/contracts), bridging the analytics table and the strategy/payoff layer.
+
+Upstream:   analytics/chain_metrics.py rows.
+Downstream: strategies/payoff.py, strategies/portfolio.py (app Strategy Lab).
+"""
+
 from __future__ import annotations
 
 import pandas as pd

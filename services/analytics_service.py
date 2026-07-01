@@ -1,3 +1,14 @@
+"""
+Analytics service: thin orchestration over the analytics engine.
+
+`build_chain_analytics()` enriches a chain (market IV, greeks, liquidity, and
+optionally model prices/mispricing). `calibrate_and_build_analytics()` chains a
+calibration and an enrichment in one call.
+
+Position in the pipeline: MarketService (+ optional Heston params) ->
+[AnalyticsService -> analytics/chain_metrics] -> enriched table for the app pages.
+"""
+
 from __future__ import annotations
 
 import pandas as pd
@@ -10,8 +21,9 @@ from services.pricing_service import HestonParameters
 def build_chain_analytics(
     options_df: pd.DataFrame,
     *,
-    r: float,
-    q: float,
+    r: float = 0.0,
+    q: float = 0.0,
+    rate_curve: dict | None = None,
     heston_params: HestonParameters | tuple[float, float, float, float, float] | None = None,
     compute_model_prices: bool = False,
     pricing_limit: int | None = None,
@@ -23,6 +35,7 @@ def build_chain_analytics(
         options_df,
         r=r,
         q=q,
+        rate_curve=rate_curve,
         heston_params=heston_params,
         compute_model_prices=compute_model_prices,
         pricing_limit=pricing_limit,
@@ -35,8 +48,8 @@ def build_chain_analytics(
 def calibrate_and_build_analytics(
     options_df: pd.DataFrame,
     *,
-    r: float,
-    q: float,
+    r: float = 0.0,
+    q: float = 0.0,
     pricing_limit: int | None = None,
     Ns: int = 40,
     Nv: int = 20,

@@ -1,3 +1,12 @@
+"""
+Black-Scholes greeks (delta, gamma, vega, theta, rho) with continuous dividend
+yield. Invalid/expired inputs return NaNs rather than raising, so the analytics
+layer can filter them.
+
+Used by analytics/chain_metrics.py to compute both market greeks (from market IV)
+and model greeks (from model IV).
+"""
+
 from __future__ import annotations
 
 import numpy as np

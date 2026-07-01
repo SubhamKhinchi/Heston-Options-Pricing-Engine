@@ -1,12 +1,15 @@
+"""
+European Black-Scholes implied volatility by Brent root-finding.
+
+There is no closed form for sigma given a price, so we bracket and solve
+BS(sigma) = target_price numerically, with no-arbitrage bound checks. Used to
+invert market mid-prices and model prices into IV across the analytics and
+calibration layers (and as the European leg of de-Americanization).
+"""
+
 import numpy as np
 from scipy.optimize import brentq
 from models.black_scholes import black_scholes_price
-
-"""
-Since there is no algebraic way to rearrange the Black-Scholes equation to solve for sigma, 
-we use a numerical root-finding algorithm (like Newton-Raphson or Brent's method) to find the volatility 
-that makes the Black-Scholes price equal to our Heston model price. Here we are using Brent's method.
-"""
 
 def implied_volatility(heston_model_price, S, K, r, T, option_type, q):
     # Basic validation

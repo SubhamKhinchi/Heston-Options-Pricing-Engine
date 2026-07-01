@@ -1,3 +1,14 @@
+"""
+Market-data service: the single entry point for loading and filtering chains.
+
+Loads raw chains (data/market_data.py), normalises them (analytics/schema), stamps
+per-row dividend yield and rate, and applies liquidity filters (data/option_filters),
+returning the cleaned frame plus drop statistics.
+
+Position in the pipeline: Market Data -> [MarketService] -> AnalyticsService /
+CalibrationService / PricingService.
+"""
+
 from __future__ import annotations
 
 from typing import Iterable
@@ -5,6 +16,8 @@ from typing import Iterable
 import pandas as pd
 
 from analytics.schema import ensure_option_frame
+from calibration.de_americanize import add_deamericanized_columns
+from config.market_config import interpolate_rate
 from data.option_filters import apply_filters
 
 
@@ -16,38 +29,98 @@ def parse_tickers(raw_tickers: str | Iterable[str]) -> list[str]:
     return tickers or ["NVDA"]
 
 
+def extract_dividend_yields(raw_df: pd.DataFrame) -> dict[str, float]:
+    """Return {ticker: dividend_yield} extracted from the raw chain DataFrame."""
+    if "dividend_yield" not in raw_df.columns or "ticker" not in raw_df.columns:
+        return {}
+    return (
+        raw_df.dropna(subset=["dividend_yield"])
+        .groupby("ticker")["dividend_yield"]
+        .first()
+        .to_dict()
+    )
+
+
 def load_live_chain(tickers: Iterable[str]) -> pd.DataFrame:
-    """Fetch raw option chain from Yahoo Finance with no filtering applied."""
+    """Fetch raw option chain from Yahoo Finance with no filtering applied.
+
+    Mirrors the notebook: get_all_options() output is returned as-is so that
+    filter_chain_with_stats (which calls ensure_option_frame internally) is the
+    single place that normalises the schema.
+    """
     from data.market_data import get_multiple_tickers
 
-    df = get_multiple_tickers(parse_tickers(tickers))
-    return ensure_option_frame(df)
+    return get_multiple_tickers(parse_tickers(tickers))
+
+
+def europeanize_chain(filtered_df: pd.DataFrame) -> pd.DataFrame:
+    """Post-filter normalization: stamp European-equivalent prices on the chain.
+
+    Adds `euro_mid` (the de-Americanized, European-equivalent mid) and `deam_iv`
+    (the de-Americanized implied vol σ*). This is the single, always-on de-Americanization
+    step for the whole pipeline — calibration and analytics both consume these columns,
+    so the market side is uniformly European-equivalent and comparable to the European
+    Heston model. Run once, after liquidity filtering (so only the survivors pay the
+    binomial-inversion cost, and the filters still see the real American quotes).
+
+    Not a user choice: this project is a European-equivalent engine, so the conversion
+    is mandatory. Per-row `r`/`q` (stamped by filter_chain_with_stats) are used.
+    """
+    if filtered_df is None or filtered_df.empty:
+        return filtered_df
+    return add_deamericanized_columns(filtered_df)
 
 
 def filter_chain_with_stats(
     raw_df: pd.DataFrame,
     *,
     spread_limit: float = 0.05,
-    r: float = 0.05,
+    r: float = 0.0,
     q: float = 0.0,
+    rate_curve: dict[float, float] | None = None,
     tickers: list[str] | None = None,
     option_types: tuple[str, ...] | None = None,
     min_volume: int = 0,
     min_open_interest: int = 0,
+    min_maturity: float | None = 7.0 / 365.0,   # drop contracts expiring within ~1 week
     max_maturity: float | None = None,
     max_contracts: int | None = None,
+    moneyness_lo: float = 0.8,
+    moneyness_hi: float = 1.2,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Single entry point for all filtering. Returns (filtered_df, stats)."""
     df = ensure_option_frame(raw_df)
-    return apply_filters(
+    # Stamp per-row q from dividend_yield before filtering so apply_filters
+    # can use it for the arbitrage bound (multi-ticker: each ticker keeps its own yield).
+    if "dividend_yield" in df.columns:
+        df["q"] = df["dividend_yield"].fillna(0.0)
+    elif "q" not in df.columns:
+        df["q"] = q
+
+    filtered_df, stats = apply_filters(
         df,
         spread_limit=spread_limit,
         r=r,
         q=q,
+        rate_curve=rate_curve,
         tickers=tickers,
         option_types=option_types,
         min_volume=min_volume,
         min_open_interest=min_open_interest,
+        min_maturity=min_maturity,
         max_maturity=max_maturity,
         max_contracts=max_contracts,
+        moneyness_lo=moneyness_lo,
+        moneyness_hi=moneyness_hi,
     )
+    if "r" not in filtered_df.columns:
+        filtered_df = filtered_df.copy()
+        if rate_curve:
+            filtered_df["r"] = filtered_df["T"].map(lambda T: interpolate_rate(rate_curve, T))
+        else:
+            filtered_df["r"] = r
+    # Post-filter normalization: stamp European-equivalent prices (euro_mid, deam_iv)
+    # once, here, so every downstream consumer (calibration, analytics) sees a uniformly
+    # European-equivalent market side. Always on — see europeanize_chain.
+    filtered_df = europeanize_chain(filtered_df)
+    return filtered_df, stats

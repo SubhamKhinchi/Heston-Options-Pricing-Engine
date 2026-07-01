@@ -1,3 +1,14 @@
+"""
+Mispricing screener: rank contracts by model-vs-market dislocation.
+
+`rank_mispriced_contracts()` filters an enriched analytics table by IV-error
+magnitude and liquidity and returns the top candidates (rich/cheap vs the
+calibrated Heston model).
+
+Upstream:   analytics/chain_metrics.py (needs model_iv/iv_error columns).
+Downstream: app/pages/07_Mispricing_Screener.py.
+"""
+
 from __future__ import annotations
 
 import pandas as pd

@@ -1,3 +1,11 @@
+"""
+OptionLeg: the atomic building block of a multi-leg strategy.
+
+Frozen dataclass describing one option position (type, strike, quantity, premium,
+greeks) with helpers for its payoff and greek contribution. Composed by
+strategies/builders.py, strategies/payoff.py, and strategies/portfolio.py.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

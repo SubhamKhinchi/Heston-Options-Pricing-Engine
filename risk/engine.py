@@ -1,3 +1,13 @@
+"""
+Risk engine: combines limit checks and scenario analysis for a strategy.
+
+`evaluate_strategy_risk()` takes an aggregated strategy summary and returns the
+limit verdicts (risk/limits) plus a spot/vol/time scenario table (risk/scenarios).
+
+Upstream:   strategies/portfolio.py summaries.
+Downstream: app/pages/4_Risk_Dashboard.py.
+"""
+
 from __future__ import annotations
 
 from risk.limits import RiskLimits, evaluate_limits

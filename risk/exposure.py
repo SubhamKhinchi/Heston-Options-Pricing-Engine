@@ -1,3 +1,9 @@
+"""
+Net-greek exposure snapshot for a strategy (net delta/gamma/vega/theta/rho).
+
+Used by risk/limits.py and the risk dashboard to read aggregate position risk.
+"""
+
 from __future__ import annotations
 
 
