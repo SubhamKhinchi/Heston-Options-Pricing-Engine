@@ -1,3 +1,11 @@
+"""
+Scenario analysis: strategy P&L across a grid of shocks.
+
+`scenario_table()` revalues a strategy over the Cartesian product of spot, vol,
+and time-decay shocks and returns the P&L grid. Consumed by risk/engine.py and
+the risk dashboard.
+"""
+
 from __future__ import annotations
 
 from itertools import product

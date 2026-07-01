@@ -1,3 +1,14 @@
+"""
+Liquidity and sanity filters for option chains.
+
+`apply_filters()` drops illiquid / unpriceable contracts (wide relative spread,
+low volume / open interest, out-of-band moneyness, expired) and enforces
+no-arbitrage price bounds, returning the kept frame plus per-stage drop counts.
+
+Upstream:   normalised chains (analytics/schema.ensure_option_frame).
+Downstream: services/market_service.filter_chain_with_stats.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -34,6 +45,7 @@ def apply_filters(
     option_types: tuple[str, ...] | None = None,
     min_volume: int = 0,
     min_open_interest: int = 0,
+    min_maturity: float | None = None,
     max_maturity: float | None = None,
     keep_positive_time: bool = True,
     max_contracts: int | None = None,
@@ -104,7 +116,13 @@ def apply_filters(
     if "openInterest" in df.columns and min_open_interest > 0:
         df = _drop(df, df["openInterest"].fillna(0) < min_open_interest, f"Open interest < {min_open_interest}", stats)
 
-    # 10. Max time to maturity
+    # 10. Time to maturity bounds.
+    # Min maturity drops near-expiry contracts (a few days out): their time value
+    # is microstructure-dominated and Fourier pricers can't resolve the very-short
+    # smile (the integrand decays too slowly to truncate), so they are noise for
+    # the surface. Max maturity caps the long end.
+    if min_maturity is not None and "T" in df.columns:
+        df = _drop(df, df["T"] < min_maturity, f"Maturity < {min_maturity*365:.0f}d", stats)
     if max_maturity is not None and "T" in df.columns:
         df = _drop(df, df["T"] > max_maturity, f"Maturity > {max_maturity}y", stats)
 

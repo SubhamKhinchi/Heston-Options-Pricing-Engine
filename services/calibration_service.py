@@ -1,3 +1,20 @@
+"""
+Calibration service: orchestrates fitting the five Heston parameters to a chain.
+
+`select_calibration_universe()` picks the out-of-the-money leg per strike relative
+to the implied forward (OTM put for K<F, OTM call for K>F — industry practice; drops
+the near-intrinsic ITM mirror and avoids double-counting), ranks near-ATM per expiry,
+and on the European-proxy path de-Americanizes the quotes (calibration/de_americanize.py)
+so the early-exercise premium is stripped before fitting. `calibrate_option_chain()`
+then runs the Levenberg-Marquardt optimiser (calibration/calibrate_heston.py, Cui
+et al. 2016) over the fast characteristic-function pricer — vega-weighting the price
+residuals so the fit behaves like an IV-space fit — no American pricer in the loop —
+and caches results under results/calibrations/.
+
+Position in the pipeline: MarketService -> [CalibrationService] -> Heston params ->
+AnalyticsService / PricingService. Downstream UI: app/pages/03_Calibrate_Heston.py.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,38 +28,26 @@ import pandas as pd
 
 from analytics.schema import ensure_option_frame
 from calibration.calibrate_heston import calibrate_heston
-from calibration.calibrate_heston_lbfgsb import calibrate_heston_lbfgsb
-from calibration.data_driven_bounds import compute_data_driven_bounds
-from calibration.implied_vol import implied_volatility
+from calibration.de_americanize import add_deamericanized_columns
 from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters
 
 
-def _loosen_data_driven_bounds(
-    bounds: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    """
-    Widen the tight per-chain bounds from compute_data_driven_bounds before
-    handing them to the optimizer.
-
-    The data-driven estimates are a good *centre* for the search, but the
-    underlying short-time smile heuristics (σ≈√(8c), ρ≈2b/σ) are only
-    approximate, so the raw ±0.20 ρ window / [0.5σ*, 2σ*] σ box can trap the
-    optimizer near a biased guess. We keep the data-driven v0/κ/θ boxes (well
-    identified by ATM level and term structure) but loosen the two parameters
-    the heuristics estimate least reliably:
-      • σ: raise the ceiling to at least 3.0 so vol-of-vol is never pre-capped
-      • ρ: widen to a ±0.40 window, clipped to (-0.999, 0.999)
-    """
-    v0_b, kappa_b, theta_b, sigma_b, rho_b = bounds
-    sigma_b = (sigma_b[0], max(sigma_b[1], 3.0))
-    rho_lo = max(rho_b[0] - 0.20, -0.999)
-    rho_hi = min(rho_b[1] + 0.20, 0.999)
-    rho_b = (rho_lo, rho_hi)
-    return [v0_b, kappa_b, theta_b, sigma_b, rho_b]
-
-
-DEFAULT_INITIAL_GUESS = HestonParameters(0.04, 2.0, 0.04, 0.5, -0.7)
+# Default search box and starting point follow Cui et al. (2016) rather than the
+# per-chain data-driven heuristics: the paper deliberately calibrates "without any
+# presumption on the values of the parameters" and shows the analytic-gradient LM
+# converges from broad, fixed ranges (their Table 5) — and even with no constraints
+# at all. DEFAULT_BOUNDS is Table 5; the guess is their representative start.
+# Note: Table 5's sigma ceiling (0.95) is calibrated to their validation set; high
+# vol-of-vol single names (e.g. NVDA) may need a wider sigma — set bounds per-run.
+DEFAULT_BOUNDS: list[tuple[float, float]] = [
+    (0.05, 0.95),     # v0
+    (0.50, 10.00),     # kappa
+    (0.05, 0.95),     # theta (long-run variance, v_bar)
+    (0.05, 3.00),     # sigma (vol-of-vol)
+    (-0.90, -0.10),   # rho
+]
+DEFAULT_INITIAL_GUESS = HestonParameters(v0=0.20, kappa=1.20, theta=0.20, sigma=0.30, rho=-0.60)
 CALIBRATION_CACHE_DIR = Path(__file__).resolve().parents[1] / "results" / "calibrations"
 
 
@@ -55,6 +60,7 @@ class CalibrationResult:
     pricing_mode: str
     calibration_style: str
     runtime_seconds: float
+    weight_scheme: str = "vega"
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -69,6 +75,7 @@ class CalibrationResult:
             "pricing_mode": self.pricing_mode,
             "calibration_style": self.calibration_style,
             "runtime_seconds": self.runtime_seconds,
+            "weight_scheme": self.weight_scheme,
         }
 
 
@@ -135,17 +142,73 @@ def select_calibration_universe(
     r: float = 0.0,
     q: float = 0.0,
     american_method: str = "european_proxy",
+    otm_only: bool = True,
+    atm_band: float = 0.02,
+    mny_lo: float | None = None,
+    mny_hi: float | None = None,
+    min_open_interest: int = 0,
+    min_maturity: float = 0.0,
+    max_maturity: float | None = None,
 ) -> pd.DataFrame:
+    """Pick the OTM, near-ATM calibration set off the (already-europeanized) chain.
+
+    The calibration universe is deliberately *tighter* than the broad pricing/screening
+    universe ("calibrate tight, price broad"): forward-moneyness band, OI floor, maturity
+    window, OTM-only leg per strike, and per-expiry near-ATM caps. The market side is
+    expected to already carry European-equivalent prices (`euro_mid`/`deam_iv`, stamped
+    by services.market_service.europeanize_chain after filtering); they are computed here
+    only if absent, so the function is still correct when called on a raw frame.
+    """
     df = ensure_option_frame(options_df)
     df = df[(df["T"] > 0) & df["mid_price"].notna()].copy()
-
     if df.empty:
         return df
 
-    if american_method == "european_proxy":
-        # Force European so the analytical Jacobian is always available.
-        df["ExerciseStyle"] = "european"
-    # For "pde" and "lsmc": keep the original ExerciseStyle from market data (american).
+    # Maturity window (calibration-specific; drops noisy front-week / stale long-dated).
+    if min_maturity:
+        df = df[df["T"] >= min_maturity]
+    if max_maturity is not None:
+        df = df[df["T"] <= max_maturity]
+
+    # Forward-moneyness band — calibration-specific, applied on top of the broad filter.
+    # Uses K/F (implied-forward moneyness) when available, else spot K/S.
+    fm = df["forward_moneyness"] if "forward_moneyness" in df.columns else df["moneyness"]
+    df = df.assign(_fm=fm)
+    df = df[df["_fm"].notna() & (df["_fm"] > 0)]
+    if mny_lo is not None:
+        df = df[df["_fm"] >= mny_lo]
+    if mny_hi is not None:
+        df = df[df["_fm"] <= mny_hi]
+    if min_open_interest and "openInterest" in df.columns:
+        df = df[df["openInterest"].fillna(0.0) >= min_open_interest]
+    if df.empty:
+        return df.drop(columns=["_fm"], errors="ignore")
+
+    # OTM-only selection (industry practice): per strike, keep the out-of-the-money
+    # leg relative to the implied forward F — the put when K < F, the call when K > F
+    # (in the |ln(K/F)| ≤ atm_band ATM zone, keep the marginally-OTM leg). This drops
+    # the ITM mirror (wide-spread, near-intrinsic, low vol-information, early-exercise
+    # noise) and avoids double-counting a call+put at the same strike (same IV).
+    if otm_only:
+        log_fm = np.log(df["_fm"])
+        is_put = df["type"].eq("put")
+        is_call = df["type"].eq("call")
+        atm_zone = log_fm.abs() <= atm_band
+        keep = (
+            ((log_fm < -atm_band) & is_put)
+            | ((log_fm > atm_band) & is_call)
+            | (atm_zone & (((log_fm <= 0) & is_put) | ((log_fm > 0) & is_call)))
+        )
+        df = df[keep.fillna(False)].copy()
+        if df.empty:
+            return df.drop(columns=["_fm"], errors="ignore")
+
+    # European-equivalent engine: always calibrate on European contracts so the
+    # analytic Cui gradient is available. Quotes are de-Americanized upstream, and
+    # the American PDE/LSMC pricers have been removed (see _graveyard.py), so the
+    # `american_method` argument is retained only for backward-compatible call
+    # sites — "european_proxy" is the sole supported path.
+    df["ExerciseStyle"] = "european"
 
     expiry_key = "maturity" if "maturity" in df.columns else "T"
     selected_groups: list[pd.DataFrame] = []
@@ -164,21 +227,21 @@ def select_calibration_universe(
             break
 
     if not selected_groups:
-        return df.head(0).copy()
+        return df.head(0).drop(columns=["_fm"], errors="ignore")
 
     calibration_df = pd.concat(selected_groups, ignore_index=True)
-    calibration_df["market_iv"] = calibration_df.apply(
-        lambda row: implied_volatility(
-            row["mid_price"],
-            row["spot"],
-            row["strike"],
-            float(row.get("r", r)),
-            row["T"],
-            row["type"],
-            float(row.get("q", q)),
-        ),
-        axis=1,
-    )
+    calibration_df = calibration_df.drop(columns=["_fm"], errors="ignore")
+
+    # European-equivalent prices are the calibration target. They are normally stamped
+    # upstream (europeanize_chain); compute on the fly only if a caller passed a raw
+    # frame, so this function is self-contained. `mid_price_market` preserves the raw
+    # American quote; `deam_iv` (σ*) is the European-equivalent market IV used for
+    # vega-weighting downstream.
+    if "euro_mid" not in calibration_df.columns or "deam_iv" not in calibration_df.columns:
+        calibration_df = add_deamericanized_columns(calibration_df, r=r, q=q)
+    calibration_df["mid_price_market"] = calibration_df["mid_price"]
+    calibration_df["mid_price"] = calibration_df["euro_mid"].fillna(calibration_df["mid_price"])
+    calibration_df["market_iv"] = calibration_df["deam_iv"]
     return calibration_df
 
 
@@ -190,7 +253,6 @@ def calibrate_option_chain(
     rate_curve: dict | None = None,
     initial_guess: HestonParameters = DEFAULT_INITIAL_GUESS,
     bounds: list[tuple[float, float]] | None = None,
-    use_data_driven: bool = True,
     Ns: int = 40,
     Nv: int = 20,
     Nt: int = 40,
@@ -198,6 +260,14 @@ def calibrate_option_chain(
     contracts_per_expiry: int | None = None,
     objective: str | None = None,
     american_method: str = "european_proxy",
+    otm_only: bool = True,
+    atm_band: float = 0.02,
+    mny_lo: float | None = None,
+    mny_hi: float | None = None,
+    min_open_interest: int = 0,
+    min_maturity: float = 0.0,
+    max_maturity: float | None = None,
+    weight_scheme: str = "vega",
 ) -> tuple[CalibrationResult, pd.DataFrame]:
     # LM always minimises price residuals (Cui et al., 2016).
     # The objective parameter is retained for API compatibility only.
@@ -213,6 +283,13 @@ def calibrate_option_chain(
         r=r,
         q=q,
         american_method=american_method,
+        otm_only=otm_only,
+        atm_band=atm_band,
+        mny_lo=mny_lo,
+        mny_hi=mny_hi,
+        min_open_interest=min_open_interest,
+        min_maturity=min_maturity,
+        max_maturity=max_maturity,
     )
 
     if calibration_df.empty:
@@ -227,31 +304,15 @@ def calibrate_option_chain(
         else:
             calibration_df["r"] = r
 
-    # Derive a per-chain initial guess and search bounds from the shape of the
-    # market IV surface, instead of always starting from the static default.
-    # Only when the caller did not supply explicit bounds.
+    # Search box: caller-supplied bounds, else the Cui et al. (2016) defaults.
+    # No per-chain data-driven boxing (the paper deliberately avoids presuming
+    # parameter values — see DEFAULT_BOUNDS).
     ig_list = list(initial_guess.as_tuple())
-    effective_bounds = bounds
-    if use_data_driven and bounds is None:
-        dd = compute_data_driven_bounds(calibration_df, r=r, q=q)
-        warn = dd["diagnostics"].get("warning")
-        if warn:
-            # Not enough liquid maturities/strikes to read the surface —
-            # compute_data_driven_bounds already fell back to static defaults.
-            print(f"[calibration] data-driven bounds unavailable: {warn} "
-                  f"Using static default guess/bounds.")
-        else:
-            effective_bounds = _loosen_data_driven_bounds(dd["bounds"])
-            # Adopt the data-driven guess only if the caller kept the default.
-            if initial_guess == DEFAULT_INITIAL_GUESS:
-                ig_list = dd["initial_guess"]
-            diag = dd["diagnostics"]
-            print(
-                "[calibration] using data-driven guess/bounds "
-                f"({diag.get('n_liquid_maturities')} liquid maturities): "
-                f"v0={ig_list[0]:.4f} kappa={ig_list[1]:.4f} theta={ig_list[2]:.4f} "
-                f"sigma={ig_list[3]:.4f} rho={ig_list[4]:+.4f}"
-            )
+    effective_bounds = bounds if bounds is not None else DEFAULT_BOUNDS
+
+    # Guarantee the initial guess lies inside the search box (scipy's
+    # least_squares rejects an out-of-bounds start). Clamp each component.
+    ig_list = [min(max(g, lo), hi) for g, (lo, hi) in zip(ig_list, effective_bounds)]
 
     start_time = perf_counter()
     params_opt, loss_val = calibrate_heston(
@@ -265,6 +326,7 @@ def calibrate_option_chain(
         bounds=effective_bounds,
         objective=objective,
         pricing_mode=pricing_mode,
+        weight_scheme=weight_scheme,
     )
     runtime_seconds = perf_counter() - start_time
 
@@ -276,57 +338,6 @@ def calibrate_option_chain(
         pricing_mode=pricing_mode,
         calibration_style=american_method,
         runtime_seconds=float(runtime_seconds),
-    )
-    return result, calibration_df
-
-
-def calibrate_option_chain_lbfgsb(
-    options_df: pd.DataFrame,
-    *,
-    r: float,
-    q: float,
-    initial_guess: HestonParameters = DEFAULT_INITIAL_GUESS,
-    bounds: list[tuple[float, float]] | None = None,
-    max_expiries: int | None = None,
-    contracts_per_expiry: int | None = None,
-) -> tuple[CalibrationResult, pd.DataFrame]:
-    """
-    Calibrate Heston parameters using the L-BFGS-B optimizer with scalar MSE
-    price loss.  Uses the same Gauss-Legendre pricing and the same full contract
-    universe (calls + puts, European proxy) as the LM method, so the two methods
-    are directly comparable.
-    """
-    calibration_df = select_calibration_universe(
-        options_df,
-        max_expiries=max_expiries,
-        contracts_per_expiry=contracts_per_expiry,
-        r=r,
-        q=q,
-    )
-
-    if calibration_df.empty:
-        raise ValueError("No valid contracts available for calibration.")
-
-    calibration_df = calibration_df.copy()
-    calibration_df["r"] = r
-
-    start_time = perf_counter()
-    params_opt, loss_val = calibrate_heston_lbfgsb(
-        r=r,
-        q=q,
-        option_df=calibration_df,
-        initial_guess=list(initial_guess.as_tuple()),
-        bounds=bounds,
-    )
-    runtime_seconds = perf_counter() - start_time
-
-    result = CalibrationResult(
-        params=HestonParameters.from_iterable(params_opt),
-        loss=float(loss_val),
-        contract_count=len(calibration_df),
-        objective="price_mse",
-        pricing_mode="european_proxy",
-        calibration_style="lbfgsb",
-        runtime_seconds=float(runtime_seconds),
+        weight_scheme=weight_scheme,
     )
     return result, calibration_df

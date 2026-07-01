@@ -1,3 +1,16 @@
+"""
+Live option-chain ingestion from Yahoo Finance.
+
+Fetches full option chains via yfinance, attaches spot, classifies each
+instrument (exercise style + dividend treatment, see data/instrument_classifier),
+and stamps an implied-forward-based dividend yield (see data/forward_curve). The
+raw, un-normalised frame is returned as-is; schema normalisation happens later in
+analytics/schema.ensure_option_frame.
+
+Upstream:   yfinance.
+Downstream: services/market_service.load_live_chain.
+"""
+
 from __future__ import annotations
 
 import numpy as np

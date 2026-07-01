@@ -1,3 +1,11 @@
+"""
+Strategy payoff/P&L across a spot grid.
+
+Builds a spot grid, evaluates the combined expiry payoff of a set of OptionLegs
+over it, and locates break-even points. Consumed by strategies/portfolio.py and
+the Strategy Lab page for payoff charts.
+"""
+
 from __future__ import annotations
 
 from typing import Iterable

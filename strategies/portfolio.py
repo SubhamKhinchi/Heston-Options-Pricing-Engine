@@ -1,3 +1,11 @@
+"""
+Multi-leg strategy aggregation.
+
+Combines a set of OptionLegs into a single summary: net cost, net greeks, the
+payoff curve, max profit/loss, and break-evens. This summary is the object the
+risk layer (risk/engine.py) and the Strategy Lab / Risk Dashboard pages consume.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable

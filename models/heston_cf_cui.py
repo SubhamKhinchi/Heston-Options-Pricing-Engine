@@ -42,15 +42,18 @@ def _intermediates(u, kappa, theta, sigma, rho, T):
     return xi, d, A1, A2, A, D, sinh_hdT, cosh_hdT
 
 
-def heston_cf_cui(u, v0, kappa, theta, sigma, rho, S0, r, T):
+def heston_cf_cui(u, v0, kappa, theta, sigma, rho, S0, r, T, q=0.0):
     """
-    Cui et al. CF, Eq. 18.  Vectorised: u may be a scalar or 1-D array.
+    Cui et al. CF, Eq. 18, with continuous carry q (the implied-forward yield).
 
-    φ(θ; u, t) = exp{ iu(log S₀ + rt) − tκθρiu/σ − v₀A + (2κθ/σ²)D }
+    The risk-neutral log-drift is (r − q), i.e. the forward is S₀·e^{(r−q)T}, so
+    the CF is consistent with the de-Americanized market quotes and the quad pricer.
+
+    φ(θ; u, t) = exp{ iu(log S₀ + (r−q)t) − tκθρiu/σ − v₀A + (2κθ/σ²)D }
     """
     _, _, _, _, A, D, _, _ = _intermediates(u, kappa, theta, sigma, rho, T)
 
-    exponent = (1j * u * (np.log(S0) + r * T)
+    exponent = (1j * u * (np.log(S0) + (r - q) * T)
                 - T * kappa * theta * rho * 1j * u / sigma
                 - v0 * A
                 + 2.0 * kappa * theta / sigma ** 2 * D)
@@ -58,7 +61,7 @@ def heston_cf_cui(u, v0, kappa, theta, sigma, rho, S0, r, T):
     return np.exp(exponent)
 
 
-def heston_cf_and_gradient(u, v0, kappa, theta, sigma, rho, S0, r, T):
+def heston_cf_and_gradient(u, v0, kappa, theta, sigma, rho, S0, r, T, q=0.0):
     """
     Compute φ(θ; u, T) and the gradient multiplier vector h(u) such that
 
@@ -76,7 +79,9 @@ def heston_cf_and_gradient(u, v0, kappa, theta, sigma, rho, S0, r, T):
         u, kappa, theta, sigma, rho, T
     )
 
-    exponent = (1j * u * (np.log(S0) + r * T)
+    # Carry q enters only the (r − q) log-drift; it is θ-independent, so the
+    # gradient multipliers h below are unchanged.
+    exponent = (1j * u * (np.log(S0) + (r - q) * T)
                 - T * kappa * theta * rho * 1j * u / sigma
                 - v0 * A
                 + 2.0 * kappa * theta / sigma ** 2 * D)

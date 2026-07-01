@@ -4,12 +4,15 @@ The bucket a ticker falls into determines two things the pricing engine needs:
 
 1. **Exercise style** — cash-settled index options (SPX, NDX, DJX, RUT) are
    European; ETF options (SPY, QQQ, DIA, IWM) and single stocks are American.
-2. **Dividend method** — single stocks and ETFs pay *discrete* cash dividends;
-   cash indices are modelled with a *continuous* dividend yield.
+2. **Dividend method** — every instrument is priced with a *continuous*
+   dividend yield. Cash indices are natively continuous; for single stocks and
+   ETFs the implied-forward yield bakes the market's expected discrete cash
+   dividends into one effective continuous rate, so the pricing path never
+   needs a discrete cashflow schedule.
 
 The primary forward-curve method (implied forward from put-call parity) is
-type-agnostic, so this classifier only decides the *fallback* dividend method
-and the exercise style.
+type-agnostic, so this classifier only decides the exercise style — the
+dividend method is continuous for every type.
 """
 from __future__ import annotations
 
@@ -38,7 +41,7 @@ class InstrumentInfo:
     ticker: str
     instrument_type: str   # EQUITY | ETF | INDEX
     exercise_style: str    # american | european
-    dividend_method: str   # discrete | continuous
+    dividend_method: str   # always "continuous" (see module docstring)
     source: str            # how the classification was decided
 
 
@@ -85,14 +88,15 @@ def classify(ticker: str, *, use_network: bool = True) -> InstrumentInfo:
 
 
 def _build(ticker: str, instrument_type: str, source: str) -> InstrumentInfo:
-    if instrument_type == "INDEX":
-        exercise, div_method = "european", "continuous"
-    else:  # EQUITY, ETF
-        exercise, div_method = "american", "discrete"
+    exercise = "european" if instrument_type == "INDEX" else "american"
+    # Every instrument is priced with a continuous dividend yield: for equities
+    # and ETFs the implied-forward yield already embeds the expected discrete
+    # cash dividends as an effective continuous rate, so there is no separate
+    # discrete-dividend pricing path.
     return InstrumentInfo(
         ticker=ticker,
         instrument_type=instrument_type,
         exercise_style=exercise,
-        dividend_method=div_method,
+        dividend_method="continuous",
         source=source,
     )

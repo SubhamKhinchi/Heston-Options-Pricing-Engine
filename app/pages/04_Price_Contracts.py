@@ -1,3 +1,12 @@
+"""
+Step 4 — Price Contracts.
+
+Prices every filtered contract under a chosen calibration's parameters using the
+European Heston model (closed form), then adds the de-Americanized market IV, model
+IV, BS Greeks, and mispricing metrics — the same European-equivalent basis used for
+calibration and the vol surface. Upstream: Step 3 (Calibrate Heston).
+"""
+
 from __future__ import annotations
 
 import sys
@@ -15,27 +24,28 @@ import streamlit as st
 
 from services.analytics_service import build_chain_analytics
 from services.market_service import parse_tickers
-from services.pricing_service import HestonParameters, price_option_frame
+from services.pricing_service import HestonParameters
 
 st.set_page_config(page_title="Price Contracts", layout="wide")
 st.title("Step 4 — Price Contracts")
 st.caption(
-    "Apply calibrated Heston parameters to price every filtered contract. "
-    "Adds model price, model IV, BS Greeks, and mispricing metrics to the chain."
+    "Apply calibrated Heston parameters to price every filtered contract under the "
+    "European Heston model. Adds model price, de-Americanized market IV, model IV, "
+    "BS Greeks, and mispricing metrics to the chain."
 )
 
 ss = st.session_state
 
 _METHOD_LABELS = {
-    "european_proxy": "European Proxy",
-    "pde":            "PDE Solver",
-    "lsmc":           "LSMC Simulation",
+    "european_proxy": "Characteristic-Function",
 }
 
 
 def _completed_methods(cal: dict) -> dict[str, str]:
+    # Prefer the label the calibration page stored (e.g. "Characteristic-Function")
+    # so the source dropdown matches; fall back to the static method label.
     return {
-        code: _METHOD_LABELS[code]
+        code: cal[code]["meta"].get("method_label", _METHOD_LABELS[code])
         for code in _METHOD_LABELS
         if code in cal and "meta" in cal[code]
     }
@@ -122,20 +132,12 @@ with col_left:
     st.dataframe(p_df, hide_index=True, use_container_width=True)
 
 with col_right:
-    st.markdown("**Pricing method for American options**")
-    pricing_method = st.selectbox(
-        "American-option pricing method",
-        options=["european_proxy", "pde", "lsmc"],
-        format_func=lambda c: _METHOD_LABELS[c],
-        index=0,
-        help=(
-            "European Proxy: fastest — treats American as European. "
-            "PDE: accurate finite-difference grid. "
-            "LSMC: Monte Carlo, slowest."
-        ),
-        key="pricing_method_select",
+    st.markdown("**Pricing**")
+    st.caption(
+        "Contracts are priced with the **European Heston** closed form — consistent "
+        "with the de-Americanized calibration and vol surface. American pricing "
+        "(PDE / LSMC) is not used here."
     )
-
     pricing_limit = st.number_input(
         "Pricing limit (max contracts)",
         min_value=10, max_value=5000,
@@ -148,25 +150,6 @@ with col_right:
         ),
     )
 
-    # Method-specific inputs
-    if pricing_method == "pde":
-        st.markdown("**PDE grid settings**")
-        g1, g2, g3 = st.columns(3)
-        Ns = g1.number_input("Ns (stock steps)", min_value=5, max_value=200, value=40, step=5, key="p_Ns")
-        Nv = g2.number_input("Nv (var steps)",   min_value=5, max_value=200, value=20, step=5, key="p_Nv")
-        Nt = g3.number_input("Nt (time steps)",  min_value=5, max_value=200, value=40, step=5, key="p_Nt")
-        M, N_lsmc = 100, 10000  # unused for PDE
-
-    elif pricing_method == "lsmc":
-        st.markdown("**LSMC settings**")
-        l1, l2 = st.columns(2)
-        M      = l1.number_input("Time steps (M)",   min_value=10, max_value=500,   value=50,   step=10, key="p_M")
-        N_lsmc = l2.number_input("Paths (N)",        min_value=100, max_value=50000, value=1000, step=100, key="p_N")
-        Ns, Nv, Nt = 40, 20, 40  # unused for LSMC
-
-    else:  # european_proxy
-        Ns, Nv, Nt, M, N_lsmc = 40, 20, 40, 100, 10000
-
 price_clicked = st.button(
     f"Price Contracts  ({len(filtered_df):,} in chain, limit {int(pricing_limit)})",
     type="primary",
@@ -174,59 +157,33 @@ price_clicked = st.button(
 
 # ── Price ─────────────────────────────────────────────────────────────────────
 if price_clicked:
-    progress = st.progress(0, text="Starting pricing …")
-
-    with st.spinner(
-        f"Pricing with {_METHOD_LABELS[pricing_method]} — "
-        f"up to {int(pricing_limit)} contracts …"
-    ):
+    with st.spinner(f"Pricing up to {int(pricing_limit)} contracts (European Heston) …"):
         try:
-            # Step 1: compute model prices via price_option_frame (controls american_method)
-            progress.progress(10, text="Computing Heston model prices …")
-            model_prices: pd.Series = price_option_frame(
+            # build_chain_analytics prices the European Heston model, de-Americanizes
+            # the market quotes, and computes IVs, Greeks, and mispricing metrics.
+            analytics_df = build_chain_analytics(
                 filtered_df,
                 r=r,
                 q=q,
                 rate_curve=rate_curve,
                 heston_params=hp,
+                compute_model_prices=True,
                 pricing_limit=int(pricing_limit),
-                Ns=int(Ns),
-                Nv=int(Nv),
-                Nt=int(Nt),
-                M=int(M),
-                N=int(N_lsmc),
-                american_method=pricing_method,
             )
-            progress.progress(60, text="Computing market IV, Greeks, mispricing …")
-
-            # Step 2: inject model_price into df, then enrich (market IV, Greeks, errors)
-            df_with_prices = filtered_df.copy()
-            df_with_prices["model_price"] = model_prices
-
-            analytics_df = build_chain_analytics(
-                df_with_prices,
-                r=r,
-                q=q,
-                rate_curve=rate_curve,
-                compute_model_prices=False,  # already in df
-            )
-            progress.progress(100, text="Done.")
 
             ss["analytics_df"] = analytics_df
             ss["pricing_params"] = {
                 "cal_method": cal_code,
-                "pricing_method": pricing_method,
                 "pricing_limit": int(pricing_limit),
             }
 
-            n_priced = int(model_prices.notna().sum())
+            n_priced = int(analytics_df["model_price"].notna().sum()) if "model_price" in analytics_df.columns else 0
             st.success(
                 f"Priced {n_priced:,} of {len(filtered_df):,} contracts "
-                f"using **{done[cal_code]}** params + **{_METHOD_LABELS[pricing_method]}** pricing."
+                f"using **{done[cal_code]}** params (European Heston)."
             )
         except Exception as exc:
             st.error(f"Pricing failed: {exc}")
-            progress.empty()
             st.stop()
 
     st.rerun()
@@ -244,7 +201,7 @@ pp: dict = ss.get("pricing_params", {})
 
 st.caption(
     f"Priced with: **{done.get(pp.get('cal_method', cal_code), '?')} params**  |  "
-    f"Method: **{_METHOD_LABELS.get(pp.get('pricing_method', pricing_method), '?')}**  |  "
+    f"Model: **European Heston**  |  "
     f"Limit: {pp.get('pricing_limit', '?')}"
 )
 

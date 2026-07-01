@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Compiled extensions / build artifacts (C++ Monte Carlo extension, etc.)
+*.so
+build/
+
 # Environments
 .venv/
 env/
@@ -12,6 +16,8 @@ ENV/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+*.ipynb.bak
+nbconvert_run.log
 
 # OS generated files
 .DS_Store
@@ -22,6 +28,10 @@ CLAUDE.md
 
 *.json
 *.xlsx
+$.pdf
+.ipynb
 
 # Archived pages (old UI — kept for local reference, not tracked in git)
 app/pages/_archived_pages/
+# Code graveyard (removed code kept locally for reference)
+_graveyard.py

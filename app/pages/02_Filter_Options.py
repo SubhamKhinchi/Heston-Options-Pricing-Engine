@@ -1,3 +1,11 @@
+"""
+Step 2 — Filter Options.
+
+Applies liquidity / no-arbitrage filters (services/market_service.filter_chain_with_stats)
+to the raw chain from Step 1 and stashes the filtered chain in session state.
+Upstream: Step 1 (Fetch Data). Downstream: Step 3 (Calibrate Heston).
+"""
+
 from __future__ import annotations
 
 import sys
@@ -10,6 +18,8 @@ for path in (PROJECT_ROOT, APP_ROOT):
         sys.path.insert(0, str(path))
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from services.market_service import filter_chain_with_stats, parse_tickers
@@ -103,6 +113,17 @@ with col2:
         step=0.05, format="%.2f",
         help="1.2 = strikes up to 120% of spot (standard near-ATM band).",
     )
+    _prev_min_mat = prev.get("min_maturity", 7.0 / 365.0)
+    _min_days_default = int(round(_prev_min_mat * 365)) if _prev_min_mat else 0
+    min_maturity_days = st.number_input(
+        "Min maturity (days)",
+        min_value=0, max_value=90,
+        value=_min_days_default,
+        step=1,
+        help="Drop contracts expiring within this many days — near-expiry options are "
+             "microstructure-noisy and not reliably priceable by the Fourier model "
+             "(default 7 = 1 week).",
+    )
     max_maturity = st.number_input(
         "Max maturity (years)",
         min_value=0.01, max_value=float(max(data_max_T, 10.0)),
@@ -124,6 +145,7 @@ if filter_clicked:
         min_open_interest=int(min_open_interest),
         moneyness_lo=moneyness_lo,
         moneyness_hi=moneyness_hi,
+        min_maturity=(int(min_maturity_days) / 365.0 if int(min_maturity_days) > 0 else None),
         max_maturity=max_maturity,
         option_types=tuple(option_types),
     )
@@ -145,7 +167,10 @@ if filter_clicked:
             "and Moneyness band (try 0.5–2.0 to include more strikes)."
         )
     else:
-        st.success(f"{len(filtered_df):,} contracts passed all filters.")
+        st.success(
+            f"{len(filtered_df):,} contracts passed all filters and were normalized to "
+            "European-equivalent prices (de-Americanized)."
+        )
     st.rerun()
 
 # ── Display results ───────────────────────────────────────────────────────────
@@ -169,6 +194,56 @@ c4.metric(
     if not filtered_df.empty else "—",
 )
 
+# ── Filter insights ───────────────────────────────────────────────────────────
+_TYPE_COLORS = {"call": "#2196F3", "put": "#EF5350"}
+
+
+def _dropped_by_reason_fig(stats: dict) -> go.Figure | None:
+    items = [(k, v) for k, v in stats.items() if v]
+    if not items:
+        return None
+    items.sort(key=lambda kv: kv[1])
+    fig = go.Figure(go.Bar(
+        x=[v for _, v in items], y=[k for k, _ in items],
+        orientation="h", marker_color="#EF5350",
+        text=[f"{v:,}" for _, v in items], textposition="outside",
+    ))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis_title="Contracts dropped", yaxis_title="")
+    return fig
+
+
+def _kept_per_expiry_fig(df: pd.DataFrame) -> go.Figure | None:
+    if df.empty or "maturity" not in df.columns or "type" not in df.columns:
+        return None
+    g = df.groupby(["maturity", "type"]).size().reset_index(name="n")
+    fig = px.bar(
+        g, x="maturity", y="n", color="type", barmode="group",
+        color_discrete_map=_TYPE_COLORS,
+        labels={"maturity": "Expiry", "n": "Contracts", "type": ""},
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                      legend_title_text="", xaxis_tickangle=-45)
+    return fig
+
+
+st.subheader("Filter insights")
+ins1, ins2 = st.columns(2)
+with ins1:
+    st.caption("Contracts removed by each filter")
+    fig_drop = _dropped_by_reason_fig(filter_stats)
+    if fig_drop is not None:
+        st.plotly_chart(fig_drop, use_container_width=True)
+    else:
+        st.info("No contracts were dropped — every raw contract passed.")
+with ins2:
+    st.caption("Surviving contracts per expiry (calls vs puts)")
+    fig_keep = _kept_per_expiry_fig(filtered_df)
+    if fig_keep is not None:
+        st.plotly_chart(fig_keep, use_container_width=True)
+    else:
+        st.info("No contracts survived the filters.")
+
 # Filter breakdown
 st.subheader("Filter breakdown")
 if filter_stats:
@@ -187,8 +262,15 @@ else:
 # Filtered contracts table
 if not filtered_df.empty:
     st.subheader("Filtered contracts")
+    st.caption(
+        "`euro_mid` is the **European-equivalent** mid (American early-exercise premium "
+        "stripped via a binomial tree); `deam_iv` is its implied vol σ*. These are the "
+        "single source of the European market side used by calibration and analytics — "
+        "always applied, so the model (European Heston) and market are compared like-for-like."
+    )
     _COLS = ["ticker", "type", "maturity", "strike", "spot",
-             "mid_price", "rel_spread", "volume", "openInterest", "moneyness", "T"]
+             "mid_price", "euro_mid", "deam_iv", "rel_spread", "volume",
+             "openInterest", "moneyness", "T"]
     show_cols = [c for c in _COLS if c in filtered_df.columns]
     st.dataframe(filtered_df[show_cols], use_container_width=True, hide_index=True)
 

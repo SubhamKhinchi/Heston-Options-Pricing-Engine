@@ -1,3 +1,11 @@
+"""
+Step 5 — Volatility Surface.
+
+Builds and contrasts the market IV surface against the calibrated Heston model IV
+surface (analytics/surfaces.build_surface_grid). The model-vs-market gap is the
+basis for the mispricing view. Upstream: Steps 3-4 (calibration + analytics).
+"""
+
 from __future__ import annotations
 
 import sys
@@ -15,7 +23,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-from analytics.surfaces import build_surface_grid
+from analytics.surfaces import build_surface_grid, select_otm_smile
 
 st.set_page_config(page_title="Volatility Surface", layout="wide")
 st.title("Step 5 — Volatility Surface Analysis")
@@ -68,42 +76,70 @@ with ctrl1:
         df = df_full.copy()
 
 with ctrl2:
-    opt_type_choice = st.selectbox(
-        "Option type",
-        options=["All", "Calls only", "Puts only"],
+    smile_basis = st.selectbox(
+        "Market smile basis",
+        options=["OTM only (clean)", "Calls only", "Puts only", "All quotes (raw)"],
         index=0,
-        key="vs_opt_type",
+        key="vs_smile_basis",
+        help="OTM only keeps the liquid out-of-the-money leg per strike (one IV per "
+             "strike, no ITM noise or call/put double-count). 'All quotes' is the raw "
+             "both-legs view including ITM.",
     )
 
 with ctrl3:
     x_axis_mode = st.selectbox(
         "X-axis (smile / surface)",
-        options=["moneyness", "log_moneyness", "strike"],
+        options=["forward_moneyness", "log_forward_moneyness", "moneyness", "log_moneyness", "strike"],
         format_func=lambda x: {
-            "moneyness": "Moneyness  K/S",
-            "log_moneyness": "Log-moneyness  ln(K/S)",
+            "forward_moneyness": "Forward-moneyness  K/F",
+            "log_forward_moneyness": "Log forward-moneyness  ln(K/F)",
+            "moneyness": "Spot-moneyness  K/S",
+            "log_moneyness": "Log spot-moneyness  ln(K/S)",
             "strike": "Strike price",
         }[x],
         index=0,
         key="vs_x_axis",
     )
 
-# Apply option type filter
-if opt_type_choice == "Calls only":
-    df = df[df["type"] == "call"].copy()
-elif opt_type_choice == "Puts only":
-    df = df[df["type"] == "put"].copy()
-
-# Ensure log_moneyness exists
+# Forward-moneyness K/F is the economically-correct ATM measure (K = F is ATM) and
+# matches the basis used by calibration / de-Americanization. Fall back to spot K/S
+# only when no implied forward was stamped. `m_col` is the moneyness basis used by all
+# the ATM / skew / risk-reversal / arbitrage logic below, independent of the x-axis the
+# user picks for the smile/surface plots. Computed on the full (both-leg) frame *before*
+# the basis selection, so the OTM-leg split below can use K/F.
+has_fwd = "forward_moneyness" in df.columns and df["forward_moneyness"].notna().any()
+if has_fwd:
+    df["forward_moneyness"] = (
+        df["forward_moneyness"].where(df["forward_moneyness"] > 0).fillna(df.get("moneyness"))
+    )
+    m_col = "forward_moneyness"
+    m_label = "K/F"
+else:
+    df["forward_moneyness"] = df.get("moneyness")
+    m_col = "moneyness"
+    m_label = "K/S"
 if "moneyness" in df.columns:
     df["log_moneyness"] = np.log(df["moneyness"].clip(lower=1e-4))
+df["log_forward_moneyness"] = np.log(df["forward_moneyness"].clip(lower=1e-4))
 
-x_col = x_axis_mode if x_axis_mode in df.columns else "moneyness"
+# Market smile basis — which contracts represent the smile at each strike.
+#  - "OTM only" keeps the liquid OTM leg per strike (one IV/strike, no ITM noise, no
+#    call/put double-count) — the clean, recommended representation (see select_otm_smile).
+#  - calls/puts isolate one type; "All quotes" keeps both legs incl. ITM (raw).
+if smile_basis == "OTM only (clean)":
+    df = select_otm_smile(df)
+elif smile_basis == "Calls only":
+    df = df[df["type"] == "call"].copy()
+elif smile_basis == "Puts only":
+    df = df[df["type"] == "put"].copy()
+
+x_col = x_axis_mode if x_axis_mode in df.columns else m_col
 df_iv = df.dropna(subset=["market_iv", "T", x_col]).copy()
 
 n_expiries = df_iv["maturity"].nunique() if "maturity" in df_iv.columns else 0
 st.caption(
     f"**{sel_ticker}** — {data_label}  |  "
+    f"basis: **{smile_basis}**  |  "
     f"{len(df_iv):,} contracts with market IV  |  "
     f"{n_expiries} expiries  |  "
     f"{'Model IV available ✓' if has_model else 'Market IV only'}"
@@ -125,10 +161,21 @@ tabs = st.tabs(_tabs)
 tidx = {name: i for i, name in enumerate(_tabs)}
 
 x_label = {
+    "forward_moneyness": "Forward-moneyness K/F",
+    "log_forward_moneyness": "ln(K/F)",
     "moneyness": "Moneyness K/S",
     "log_moneyness": "ln(K/S)",
     "strike": "Strike",
 }.get(x_axis_mode, x_axis_mode)
+
+# ATM reference on the x-axis: K/F=1 or K/S=1 (linear), ln=0 (log); no fixed ATM for strike.
+_ATM_X = {
+    "forward_moneyness": 1.0,
+    "moneyness": 1.0,
+    "log_forward_moneyness": 0.0,
+    "log_moneyness": 0.0,
+    "strike": None,
+}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -261,7 +308,7 @@ with tabs[tidx["📐 Smile & Skew"]]:
                                 hovertemplate=f"{mat}<br>{x_label}: %{{x:.3f}}<br>Heston IV: %{{y:.2f}}%<extra></extra>",
                             ))
 
-                atm_x = 1.0 if x_axis_mode == "moneyness" else (0.0 if x_axis_mode == "log_moneyness" else None)
+                atm_x = _ATM_X.get(x_axis_mode)
                 if atm_x is not None:
                     fig_sm.add_vline(
                         x=atm_x,
@@ -279,17 +326,17 @@ with tabs[tidx["📐 Smile & Skew"]]:
                 st.plotly_chart(fig_sm, use_container_width=True)
 
         # Skew table
-        st.subheader("Skew Summary (90%–110% moneyness)")
+        st.subheader(f"Skew Summary (90%–110% {m_label})")
         skew_rows = []
         for mat in maturities:
             mdf = df_iv[df_iv["maturity"] == mat]
             T_val = mdf["T"].iloc[0]
-            near_atm = mdf[mdf["moneyness"].between(0.97, 1.03)]
+            near_atm = mdf[mdf[m_col].between(0.97, 1.03)]
             if near_atm.empty:
-                near_atm = mdf.loc[(mdf["moneyness"] - 1.0).abs().nsmallest(2).index]
+                near_atm = mdf.loc[(mdf[m_col] - 1.0).abs().nsmallest(2).index]
             atm_iv = near_atm["market_iv"].mean()
-            put_iv = mdf[mdf["moneyness"].between(0.85, 0.95)]["market_iv"].mean()
-            call_iv = mdf[mdf["moneyness"].between(1.05, 1.15)]["market_iv"].mean()
+            put_iv = mdf[mdf[m_col].between(0.85, 0.95)]["market_iv"].mean()
+            call_iv = mdf[mdf[m_col].between(1.05, 1.15)]["market_iv"].mean()
             skew_rows.append({
                 "Expiry": mat,
                 "T (yrs)": round(T_val, 3),
@@ -312,9 +359,9 @@ with tabs[tidx["📅 Term Structure"]]:
     for mat in sorted(df_iv["maturity"].unique() if "maturity" in df_iv.columns else []):
         mdf = df_iv[df_iv["maturity"] == mat]
         T_val = mdf["T"].iloc[0]
-        near_atm = mdf[mdf["moneyness"].between(0.97, 1.03)]
+        near_atm = mdf[mdf[m_col].between(0.97, 1.03)]
         if near_atm.empty:
-            near_atm = mdf.loc[(mdf["moneyness"] - 1.0).abs().nsmallest(3).index]
+            near_atm = mdf.loc[(mdf[m_col] - 1.0).abs().nsmallest(3).index]
         for opt_t in ["call", "put"]:
             sub = near_atm[near_atm["type"] == opt_t] if "type" in near_atm.columns else near_atm
             if sub.empty:
@@ -431,28 +478,34 @@ with tabs[tidx["📊 Risk Metrics"]]:
         "Butterfly ≈ ½(OTM put IV + OTM call IV) − ATM IV."
     )
 
-    # Use full dataset (both calls and puts) for RR/butterfly regardless of type filter
+    # Use full dataset (both calls and puts) for RR/butterfly regardless of type filter.
+    # Bucket in the same forward-moneyness basis as the rest of the page.
     df_rr_base = df_full.copy()
     if "ticker" in df_rr_base.columns:
         df_rr_base = df_rr_base[df_rr_base["ticker"] == sel_ticker]
-    if "moneyness" in df_rr_base.columns:
-        df_rr_base["log_moneyness"] = np.log(df_rr_base["moneyness"].clip(lower=1e-4))
-    df_rr_base = df_rr_base.dropna(subset=["market_iv", "moneyness", "T"])
+    if m_col == "forward_moneyness" and "forward_moneyness" in df_rr_base.columns:
+        df_rr_base["forward_moneyness"] = (
+            df_rr_base["forward_moneyness"].where(df_rr_base["forward_moneyness"] > 0)
+            .fillna(df_rr_base.get("moneyness"))
+        )
+    elif "forward_moneyness" not in df_rr_base.columns:
+        df_rr_base["forward_moneyness"] = df_rr_base.get("moneyness")
+    df_rr_base = df_rr_base.dropna(subset=["market_iv", m_col, "T"])
 
     rr_rows = []
     for mat in sorted(df_rr_base["maturity"].unique() if "maturity" in df_rr_base.columns else []):
         mdf = df_rr_base[df_rr_base["maturity"] == mat]
         T_val = mdf["T"].iloc[0]
 
-        near_atm = mdf[mdf["moneyness"].between(0.97, 1.03)]
+        near_atm = mdf[mdf[m_col].between(0.97, 1.03)]
         if near_atm.empty:
-            near_atm = mdf.loc[(mdf["moneyness"] - 1.0).abs().nsmallest(2).index]
+            near_atm = mdf.loc[(mdf[m_col] - 1.0).abs().nsmallest(2).index]
         atm_iv = near_atm["market_iv"].mean()
 
         puts = mdf[(mdf.get("type", pd.Series(["call"] * len(mdf))) == "put") &
-                   mdf["moneyness"].between(0.85, 0.95)] if "type" in mdf.columns else pd.DataFrame()
+                   mdf[m_col].between(0.85, 0.95)] if "type" in mdf.columns else pd.DataFrame()
         calls = mdf[(mdf.get("type", pd.Series(["call"] * len(mdf))) == "call") &
-                    mdf["moneyness"].between(1.05, 1.15)] if "type" in mdf.columns else pd.DataFrame()
+                    mdf[m_col].between(1.05, 1.15)] if "type" in mdf.columns else pd.DataFrame()
 
         put_iv = puts["market_iv"].mean() if not puts.empty else np.nan
         call_iv = calls["market_iv"].mean() if not calls.empty else np.nan
@@ -552,7 +605,7 @@ if has_model:
                     if sub.empty:
                         continue
                     hover = (
-                        [f"mat={r['maturity']} K={r['strike']:.0f} m={r['moneyness']:.3f}"
+                        [f"mat={r['maturity']} K={r['strike']:.0f} {m_label}={r[m_col]:.3f}"
                          for _, r in sub.iterrows()]
                         if "maturity" in sub.columns else None
                     )
@@ -601,11 +654,11 @@ if has_model:
                     )
                     st.plotly_chart(fig_hist, use_container_width=True)
 
-            # IV error heatmap: moneyness × maturity
+            # IV error heatmap: forward-moneyness × maturity
             if "iv_error" in df_cmp.columns and "maturity" in df_cmp.columns:
-                st.subheader("IV Error Heatmap  (Market − Heston, vol pts %)")
-                hdf = df_cmp.dropna(subset=["iv_error", "moneyness"]).copy()
-                hdf["m_bin"] = pd.cut(hdf["moneyness"], bins=10, precision=2).astype(str)
+                st.subheader(f"IV Error Heatmap  (Market − Heston, vol pts %, {m_label})")
+                hdf = df_cmp.dropna(subset=["iv_error", m_col]).copy()
+                hdf["m_bin"] = pd.cut(hdf[m_col], bins=10, precision=2).astype(str)
                 pivot = (
                     hdf.pivot_table(
                         index="m_bin", columns="maturity",
@@ -624,7 +677,7 @@ if has_model:
                     ))
                     fig_hm.update_layout(
                         xaxis_title="Maturity",
-                        yaxis_title="Moneyness Bin",
+                        yaxis_title=f"Moneyness Bin ({m_label})",
                         height=400,
                     )
                     st.plotly_chart(fig_hm, use_container_width=True)
@@ -679,7 +732,9 @@ if has_greeks:
             with g2:
                 greek_x = st.selectbox(
                     "X-axis",
-                    options=["moneyness", "strike"],
+                    options=["forward_moneyness", "moneyness", "strike"],
+                    format_func=lambda x: {"forward_moneyness": "Forward-moneyness K/F",
+                                           "moneyness": "Moneyness K/S", "strike": "Strike"}.get(x, x),
                     key="vs_greek_x",
                 )
 
@@ -757,7 +812,7 @@ with tabs[tidx["⚖ Arb Checks"]]:
     st.markdown("#### Calendar Spread  (Total Variance non-decreasing in T)")
     cal_rows = []
     for mb in [0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15]:
-        near = df_iv[df_iv["moneyness"].between(mb - 0.025, mb + 0.025)]
+        near = df_iv[df_iv[m_col].between(mb - 0.025, mb + 0.025)]
         if "maturity" not in near.columns or near.empty:
             continue
         ts_sub = (
@@ -810,7 +865,7 @@ with tabs[tidx["⚖ Arb Checks"]]:
                 bfly_rows.append({
                     "Expiry": mat,
                     "Strike": strikes[i],
-                    "Moneyness": round(mdf_s.iloc[i]["moneyness"], 3) if "moneyness" in mdf_s.columns else "—",
+                    f"Moneyness {m_label}": round(mdf_s.iloc[i][m_col], 3) if m_col in mdf_s.columns else "—",
                     "d²IV/dK² (×1000)": round(d2iv * 1000, 4),
                     "Butterfly OK?": "✗ Violated",
                 })

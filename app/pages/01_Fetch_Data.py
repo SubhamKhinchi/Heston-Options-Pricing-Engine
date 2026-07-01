@@ -1,3 +1,12 @@
+"""
+Step 1 — Fetch Data.
+
+Loads a live option chain (services/market_service.load_live_chain) and the
+SOFR/OIS discount curve (config/market_config), then stashes the raw chain and
+rate curve in session state for the rest of the pipeline. First page in the flow;
+feeds Step 2 (Filter Options).
+"""
+
 from __future__ import annotations
 
 import sys
@@ -9,7 +18,10 @@ for path in (PROJECT_ROOT, APP_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from config.market_config import get_ois_curve, interpolate_rate, curve_summary
@@ -138,79 +150,175 @@ for tkr in tickers_list:
 summary_df = pd.DataFrame(ticker_rows)
 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-st.caption(
-    "Dividends/carry enter pricing through the **implied forward F(T)** recovered "
-    "per expiry from near-ATM put–call parity — not a single scalar dividend yield. "
-    "The implied yield q(T) = r − ln(F/S)/T is shown in the curve below **only as a "
-    "diagnostic**: it is amplified by 1/T and unstable at short maturities, which is "
-    "exactly why the engine carries F(T) rather than q."
-)
-
-# ── Implied forward curve F(T) ────────────────────────────────────────────────
-st.subheader("Implied forward curve  F(T)")
-st.caption(
-    "The forward factor F/S is the actual carry applied at each maturity "
-    "(F/S > 1 ⇒ positive net carry, < 1 ⇒ dividend drag)."
-)
-for tkr in tickers_list:
-    tkr_df = raw_df[raw_df["ticker"] == tkr] if "ticker" in raw_df.columns else raw_df
-    if tkr_df.empty or "forward" not in tkr_df.columns:
-        continue
-    spot = tkr_df["spot"].iloc[0]
-    fc = (
-        tkr_df.groupby("maturity")
-        .agg(
-            T=("T", "first"),
-            forward=("forward", "first"),
-            implied_q=("dividend_yield", "first"),
-            source=("dividend_source", "first"),
-        )
-        .reset_index()
-        .sort_values("T")
-    )
-    disp = pd.DataFrame({
-        "Maturity": fc["maturity"],
-        "T (yrs)": fc["T"].round(4),
-        "Forward F(T)": fc["forward"].round(2),
-        "Forward factor F/S": (fc["forward"] / spot).round(4),
-        "Implied q(T) [diagnostic]": (fc["implied_q"] * 100).round(3).map(lambda v: f"{v}%"),
-        "Source": fc["source"].astype(str).str.replace("_", " "),
-    })
-    if len(tickers_list) > 1:
-        st.markdown(f"**{tkr}**")
-    st.dataframe(disp, use_container_width=True, hide_index=True)
-
-# Total contracts metric
-c1, c2 = st.columns(2)
-c1.metric("Total contracts", f"{len(raw_df):,}")
-c2.metric("Total expiries", raw_df["maturity"].nunique())
-
-# Downstream status
+# Downstream status (applies to both tabs)
 if "filtered_df" in ss:
     st.success(
         f"Downstream: {len(ss['filtered_df']):,} contracts currently filtered. "
         "Pulling new data will clear the filter results."
     )
 
-# Raw chain table
-st.subheader("Raw option chain")
-_COLS = ["ticker", "instrument_type", "ExerciseStyle", "type", "maturity", "strike", "spot",
-         "bid", "ask", "mid_price", "lastPrice",
-         "volume", "openInterest", "rel_spread", "T", "moneyness",
-         "forward", "dividend_yield", "dividend_source"]
-show_cols = [c for c in _COLS if c in raw_df.columns]
-st.dataframe(raw_df[show_cols], use_container_width=True, hide_index=True)
+# Below this T (~1 month) the carry diagnostic q(T) is 1/T-amplified and unstable.
+SHORT_T = 0.08
 
-# Expiry breakdown
-with st.expander("Expiry breakdown", expanded=False):
-    expiry_table = (
-        raw_df.groupby(["ticker", "maturity"])
-        .agg(contracts=("strike", "count"), T=("T", "first"))
-        .reset_index()
-        .sort_values(["ticker", "T"])
+_TYPE_COLORS = {"call": "#2196F3", "put": "#EF5350"}
+
+
+def _contracts_per_expiry_fig(df: pd.DataFrame) -> go.Figure:
+    g = df.groupby(["maturity", "type"]).size().reset_index(name="n")
+    fig = px.bar(
+        g, x="maturity", y="n", color="type", barmode="group",
+        color_discrete_map=_TYPE_COLORS,
+        labels={"maturity": "Expiry", "n": "Contracts", "type": ""},
     )
-    expiry_table["T"] = expiry_table["T"].round(4)
-    st.dataframe(expiry_table, use_container_width=True, hide_index=True)
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                      legend_title_text="", xaxis_tickangle=-45)
+    return fig
+
+
+def _oi_by_moneyness_fig(df: pd.DataFrame) -> go.Figure | None:
+    if "openInterest" not in df.columns or "moneyness" not in df.columns:
+        return None
+    sub = df.dropna(subset=["moneyness"]).copy()
+    sub["openInterest"] = sub["openInterest"].fillna(0)
+    if sub.empty or sub["openInterest"].sum() == 0:
+        return None
+    fig = px.histogram(
+        sub, x="moneyness", y="openInterest", color="type", nbins=60,
+        histfunc="sum", color_discrete_map=_TYPE_COLORS,
+        labels={"moneyness": "Moneyness  K / S", "openInterest": "Open interest", "type": ""},
+    )
+    fig.add_vline(x=1.0, line_dash="dot", line_color="#9E9E9E")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                      legend_title_text="", bargap=0.02)
+    return fig
+
+
+def _forward_curve_fig(fc: pd.DataFrame, spot: float, rate_curve: dict) -> go.Figure:
+    T = fc["T"].to_numpy(dtype=float)
+    fwd = fc["forward"].to_numpy(dtype=float)
+    rates = (np.array([interpolate_rate(rate_curve, float(t)) for t in T])
+             if rate_curve else np.zeros_like(T))
+    financed = spot * np.exp(rates * T)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=T, y=financed, name="Financed spot  S·e^(rT)",
+                             mode="lines", line=dict(color="#9E9E9E", dash="dash")))
+    fig.add_trace(go.Scatter(x=T, y=fwd, name="Implied forward  F(T)",
+                             mode="lines+markers", line=dict(color="#2196F3")))
+    fig.add_hline(y=spot, line_dash="dot", line_color="#BDBDBD",
+                  annotation_text="Spot", annotation_position="bottom right")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+                      xaxis_title="T (years)", yaxis_title="Price")
+    return fig
+
+
+def _carry_term_fig(fc: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=fc["T"], y=fc["implied_q"] * 100, mode="lines+markers",
+                             line=dict(color="#7E57C2"), name="Implied carry q(T)"))
+    fig.add_hline(y=0, line_dash="dot", line_color="#BDBDBD")
+    fig.add_vrect(x0=0, x1=SHORT_T, fillcolor="#FF9800", opacity=0.10, line_width=0,
+                  annotation_text="1/T-amplified", annotation_position="top left")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                      showlegend=False, xaxis_title="T (years)",
+                      yaxis_title="Implied carry q(T)  (%)")
+    return fig
+
+
+tab_raw, tab_fwd = st.tabs(["📄 Raw option chain", "📈 Implied forward curve  F(T)"])
+
+# ── Tab 1: Raw option chain — insights, then the full table ───────────────────
+with tab_raw:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total contracts", f"{len(raw_df):,}")
+    m2.metric("Total expiries", raw_df["maturity"].nunique())
+    if "type" in raw_df.columns:
+        m3.metric("Calls / Puts",
+                  f"{(raw_df['type']=='call').sum():,} / {(raw_df['type']=='put').sum():,}")
+    if "rel_spread" in raw_df.columns:
+        med_spread = raw_df["rel_spread"].median()
+        m4.metric("Median rel. spread",
+                  f"{med_spread*100:.1f}%" if pd.notna(med_spread) else "—")
+
+    st.markdown("**Chain at a glance**")
+    g1, g2 = st.columns(2)
+    with g1:
+        st.caption("Contracts per expiry (calls vs puts)")
+        st.plotly_chart(_contracts_per_expiry_fig(raw_df), use_container_width=True)
+    with g2:
+        st.caption("Open interest by moneyness — where liquidity concentrates")
+        fig_oi = _oi_by_moneyness_fig(raw_df)
+        if fig_oi is not None:
+            st.plotly_chart(fig_oi, use_container_width=True)
+        else:
+            st.info("No open-interest / moneyness data to chart (common outside market hours).")
+
+    st.subheader("Raw option chain")
+    _COLS = ["ticker", "instrument_type", "ExerciseStyle", "type", "maturity", "strike", "spot",
+             "bid", "ask", "mid_price", "lastPrice",
+             "volume", "openInterest", "rel_spread", "T", "moneyness",
+             "forward", "dividend_yield", "dividend_source"]
+    show_cols = [c for c in _COLS if c in raw_df.columns]
+    st.dataframe(raw_df[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Expiry breakdown", expanded=False):
+        expiry_table = (
+            raw_df.groupby(["ticker", "maturity"])
+            .agg(contracts=("strike", "count"), T=("T", "first"))
+            .reset_index()
+            .sort_values(["ticker", "T"])
+        )
+        expiry_table["T"] = expiry_table["T"].round(4)
+        st.dataframe(expiry_table, use_container_width=True, hide_index=True)
+
+# ── Tab 2: Implied forward curve — the curve, then the table ──────────────────
+with tab_fwd:
+    st.caption(
+        "Dividends/carry enter pricing through the **implied forward F(T)** recovered "
+        "per expiry from near-ATM put–call parity — not a single scalar dividend yield. "
+        "The implied carry q(T) = r − ln(F/S)/T is shown **only as a diagnostic**, and it "
+        "is a *carry* number, not a dividend yield: for a low-dividend name it is dominated "
+        "by the financing basis, so small **negative** values are normal (forward sitting "
+        "just above S·e^(rT)). It is also amplified by 1/T and unstable at short maturities "
+        "— which is exactly why the engine carries F(T), not q."
+    )
+    for tkr in tickers_list:
+        tkr_df = raw_df[raw_df["ticker"] == tkr] if "ticker" in raw_df.columns else raw_df
+        if tkr_df.empty or "forward" not in tkr_df.columns:
+            continue
+        spot = tkr_df["spot"].iloc[0]
+        fc = (
+            tkr_df.groupby("maturity")
+            .agg(
+                T=("T", "first"),
+                forward=("forward", "first"),
+                implied_q=("dividend_yield", "first"),
+                source=("dividend_source", "first"),
+            )
+            .reset_index()
+            .sort_values("T")
+        )
+        if len(tickers_list) > 1:
+            st.markdown(f"**{tkr}**")
+
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            st.caption("Forward curve vs financed spot — the gap is net carry")
+            st.plotly_chart(_forward_curve_fig(fc, spot, _rate_curve), use_container_width=True)
+        with fcol2:
+            st.caption("Implied carry term structure q(T) [diagnostic]")
+            st.plotly_chart(_carry_term_fig(fc), use_container_width=True)
+
+        disp = pd.DataFrame({
+            "Maturity": fc["maturity"],
+            "T (yrs)": fc["T"].round(4),
+            "Forward F(T)": fc["forward"].round(2),
+            "Forward factor F/S": (fc["forward"] / spot).round(4),
+            "Forward − Spot": (fc["forward"] - spot).round(2),
+            "Implied carry q(T) [diagnostic]": (fc["implied_q"] * 100).round(3).map(lambda v: f"{v}%"),
+            "Source": fc["source"].astype(str).str.replace("_", " "),
+        })
+        st.dataframe(disp, use_container_width=True, hide_index=True)
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 st.divider()

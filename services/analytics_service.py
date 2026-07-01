@@ -1,3 +1,14 @@
+"""
+Analytics service: thin orchestration over the analytics engine.
+
+`build_chain_analytics()` enriches a chain (market IV, greeks, liquidity, and
+optionally model prices/mispricing). `calibrate_and_build_analytics()` chains a
+calibration and an enrichment in one call.
+
+Position in the pipeline: MarketService (+ optional Heston params) ->
+[AnalyticsService -> analytics/chain_metrics] -> enriched table for the app pages.
+"""
+
 from __future__ import annotations
 
 import pandas as pd

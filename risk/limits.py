@@ -1,3 +1,11 @@
+"""
+Risk limits: thresholds and pass/warn/reject evaluation.
+
+`RiskLimits` holds the configurable thresholds; `evaluate_limits()` compares a
+strategy's net-greek exposure (risk/exposure) against them and returns a verdict
+per metric. Consumed by risk/engine.py.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

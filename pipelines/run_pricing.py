@@ -1,3 +1,16 @@
+"""
+CLI: build an enriched option-chain analytics table from live data.
+
+Fetches the chain from Yahoo Finance (services/market_service.load_live_chain),
+filters it, and runs the analytics enrichment (market IV, greeks, liquidity, and —
+when --heston-params is given — model prices / IV error). Prints a preview or
+writes the full table to CSV.
+
+Example:
+    python pipelines/run_pricing.py --tickers NVDA --max-contracts 100 \\
+        --heston-params 0.04,2.0,0.04,0.5,-0.7 --output analytics.csv
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.analytics_service import build_chain_analytics
-from services.market_service import DEFAULT_SAMPLE_PATH, filter_option_chain, load_option_chain, parse_tickers
+from services.market_service import filter_chain_with_stats, load_live_chain, parse_tickers
 from services.pricing_service import HestonParameters
 
 
@@ -23,9 +36,7 @@ def _parse_params(raw_params: str | None) -> HestonParameters | None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build an option-chain analytics table.")
-    parser.add_argument("--source", choices=("sample", "live"), default="sample")
-    parser.add_argument("--sample-path", default=str(DEFAULT_SAMPLE_PATH))
+    parser = argparse.ArgumentParser(description="Build an option-chain analytics table from live data.")
     parser.add_argument("--tickers", default="NVDA")
     parser.add_argument("--spread-limit", type=float, default=0.05)
     parser.add_argument("--risk-free-rate", type=float, default=0.05)
@@ -37,9 +48,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--option-types", default="call,put")
     parser.add_argument("--heston-params", help="Optional v0,kappa,theta,sigma,rho tuple.")
     parser.add_argument("--pricing-limit", type=int, default=150)
-    parser.add_argument("--Ns", type=int, default=40)
-    parser.add_argument("--Nv", type=int, default=20)
-    parser.add_argument("--Nt", type=int, default=40)
     parser.add_argument("--output", help="Optional CSV output path.")
     return parser
 
@@ -47,19 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    tickers = parse_tickers(args.tickers)
+    option_types = tuple(t.strip() for t in args.option_types.split(",") if t.strip())
 
-    raw_df = load_option_chain(
-        source=args.source,
-        sample_path=args.sample_path,
-        tickers=parse_tickers(args.tickers),
+    raw_df = load_live_chain(tickers)
+    filtered_df, _stats = filter_chain_with_stats(
+        raw_df,
         spread_limit=args.spread_limit,
         r=args.risk_free_rate,
         q=args.dividend_yield,
-    )
-    filtered_df = filter_option_chain(
-        raw_df,
-        tickers=parse_tickers(args.tickers),
-        option_types=[option_type.strip() for option_type in args.option_types.split(",") if option_type.strip()],
+        tickers=tickers,
+        option_types=option_types,
         min_volume=args.min_volume,
         min_open_interest=args.min_open_interest,
         max_maturity=args.max_maturity,
@@ -74,9 +80,6 @@ def main() -> int:
         heston_params=heston_params,
         compute_model_prices=heston_params is not None,
         pricing_limit=args.pricing_limit,
-        Ns=args.Ns,
-        Nv=args.Nv,
-        Nt=args.Nt,
     )
 
     if args.output:

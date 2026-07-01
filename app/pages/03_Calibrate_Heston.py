@@ -1,3 +1,14 @@
+"""
+Step 3 — Calibrate Heston.
+
+Fits the five Heston parameters to the filtered chain via the single
+characteristic-function method (services/calibration_service.calibrate_option_chain):
+select the OTM, near-ATM calibration universe, then vega-weighted Levenberg-Marquardt
+over the fast CF pricer. Quotes are already de-Americanized upstream (Step 2 Filter).
+Stashes the result for downstream pricing. Upstream: Step 2.
+Downstream: Step 4 (Price Contracts) and the surface/screener pages.
+"""
+
 from __future__ import annotations
 
 import sys
@@ -12,17 +23,20 @@ for path in (PROJECT_ROOT, APP_ROOT):
 import pandas as pd
 import streamlit as st
 
-from calibration.data_driven_bounds import compute_data_driven_bounds
-from services.calibration_service import calibrate_option_chain, _loosen_data_driven_bounds
+from services.calibration_service import (
+    calibrate_option_chain,
+    DEFAULT_BOUNDS,
+    DEFAULT_INITIAL_GUESS,
+)
 from services.market_service import parse_tickers
 from services.pricing_service import HestonParameters
 
 st.set_page_config(page_title="Calibrate Heston", layout="wide")
 st.title("Step 3 — Calibrate Heston Model")
 st.caption(
-    "Fit the five Heston parameters (v₀, κ, θ̄, σ, ρ) to the filtered option chain "
-    "using the Levenberg-Marquardt optimiser (Cui et al. 2016). "
-    "Run each method independently or compare all three side by side."
+    "Fit the five Heston parameters (v₀, κ, θ̄, σ, ρ) to the de-Americanized option "
+    "chain using the Levenberg-Marquardt optimiser with the analytic Cui et al. (2016) "
+    "Jacobian. Set the initial guess and search bounds below."
 )
 
 ss = st.session_state
@@ -67,24 +81,59 @@ for tkr in parse_tickers(params.get("tickers", "NVDA")):
         f"{len(tkr_df):,} filtered contracts"
     )
 
-# ── Shared settings ───────────────────────────────────────────────────────────
-st.subheader("Shared settings")
-sh_col1, sh_col2 = st.columns(2)
-with sh_col1:
+# ── Calibration universe ──────────────────────────────────────────────────────
+st.subheader("Calibration universe")
+st.caption(
+    "The calibration set is deliberately *tighter* than the filtered (pricing) chain — "
+    "**calibrate tight, price broad**. We fit the **out-of-the-money** leg per strike off "
+    "the implied forward F (OTM put for K<F, OTM call for K>F), vega-weighted. Tune the "
+    "selection below; pricing/screening still use the full filtered chain."
+)
+uni_c1, uni_c2, uni_c3 = st.columns(3)
+with uni_c1:
+    mny_lo = st.number_input(
+        "Forward-moneyness K/F — low", min_value=0.50, max_value=1.00, value=0.85, step=0.01,
+        help="Keep strikes with K/F ≥ this. Tighter = more ATM-concentrated.",
+    )
+    mny_hi = st.number_input(
+        "Forward-moneyness K/F — high", min_value=1.00, max_value=1.50, value=1.15, step=0.01,
+        help="Keep strikes with K/F ≤ this.",
+    )
+with uni_c2:
+    min_oi = st.number_input(
+        "Min open interest", min_value=0, max_value=100000, value=0, step=100,
+        help="Calibration-specific OI floor (on top of the filter). OI is the liquidity proxy.",
+    )
+    atm_band = st.number_input(
+        "ATM zone band  |ln(K/F)|", min_value=0.0, max_value=0.20, value=0.02, step=0.01,
+        help="Within this band a strike is ATM; the marginally-OTM leg is kept.",
+    )
+with uni_c3:
+    min_mat_days = st.number_input(
+        "Min days to expiry", min_value=0, max_value=120, value=7, step=1,
+        help="Drop very short-dated contracts (microstructure noise).",
+    )
+    max_mat_years = st.number_input(
+        "Max years to expiry  (0 = no cap)", min_value=0.0, max_value=5.0, value=0.0, step=0.25,
+        help="Drop long-dated / stale LEAPS, e.g. 1.5.",
+    )
+
+exp_c1, exp_c2 = st.columns(2)
+with exp_c1:
     max_expiries = st.number_input(
-        "Max expiries to use  (0 = all)",
-        min_value=0, max_value=50, value=0, step=1,
+        "Max expiries to use  (0 = all)", min_value=0, max_value=50, value=0, step=1,
         help="Limit to the nearest N expiries to speed up calibration.",
     )
-with sh_col2:
+with exp_c2:
     contracts_per_expiry = st.number_input(
-        "Max contracts per expiry  (0 = all)",
-        min_value=0, max_value=100, value=0, step=5,
-        help="Selects near-ATM contracts per expiry when > 0.",
+        "Max contracts per expiry  (0 = all)", min_value=0, max_value=100, value=0, step=2,
+        help="Cap near-ATM contracts per expiry so no single dense expiry dominates the fit.",
     )
 
 max_exp = int(max_expiries) if max_expiries > 0 else None
 cpe = int(contracts_per_expiry) if contracts_per_expiry > 0 else None
+min_maturity = float(min_mat_days) / 365.0
+max_maturity = float(max_mat_years) if max_mat_years > 0 else None
 
 # Parameter metadata and the global feasible box (mirrors calibrate_heston._DEFAULT_BOUNDS).
 _PARAM_META = [
@@ -95,7 +144,7 @@ _PARAM_META = [
     ("ρ",  "spot-vol correlation"),
 ]
 _GLOBAL_LB = [1e-4, 1e-4, 1e-4, 1e-4, -0.999]
-_GLOBAL_UB = [2.0, 10.0, 2.0, 3.0, 0.999]
+_GLOBAL_UB = [2.0, 10.0, 2.0, 5.0, 0.999]
 
 
 def _params_from_editor(edited_df: pd.DataFrame) -> tuple[HestonParameters, list[tuple[float, float]]]:
@@ -133,56 +182,28 @@ def _run_calibration(
         max_expiries=max_exp,
         contracts_per_expiry=cpe,
         american_method=method_code,
+        mny_lo=mny_lo,
+        mny_hi=mny_hi,
+        min_open_interest=int(min_oi),
+        min_maturity=min_maturity,
+        max_maturity=max_maturity,
+        atm_band=atm_band,
     )
 
 
-# ── Data-driven initial parameters & bounds (shared across all methods) ────────
+# ── Initial parameters & search bounds (user-set; seeded from Cui et al. 2016) ──
 st.divider()
 st.subheader("Initial parameters & search bounds")
 st.caption(
-    "Estimate the five Heston parameters and their search bounds directly from the "
-    "shape of the market IV surface (ATM level, term structure, smile slope & "
-    "curvature). These are **shared across all three methods** — edit any value "
-    "before calibrating."
+    "Defaults are the fixed ranges from **Cui et al. (2016), Table 5** — the paper "
+    "calibrates *without presuming parameter values*. **Edit any cell** before "
+    "calibrating; the search box is entirely user-controlled. "
+    "Note: Table 5's σ ceiling (0.95) suits the paper's validation set — for "
+    "high vol-of-vol single names (e.g. NVDA) raise the σ upper bound."
 )
 
-if st.button("📊 Estimate data-driven parameters", type="secondary"):
-    try:
-        dd = compute_data_driven_bounds(filtered_df, r=r, q=q)
-    except Exception as e:
-        st.error(f"Estimation failed: {e}")
-    else:
-        ss["dd_estimate"] = dd
-        ss["dd_version"] = ss.get("dd_version", 0) + 1
-        st.rerun()
-
-if "dd_estimate" not in ss:
-    st.info("Click **Estimate data-driven parameters** to read a starting point from the surface.")
-    st.stop()
-
-_dd = ss["dd_estimate"]
-_ig = _dd["initial_guess"]
-_diag = _dd["diagnostics"]
-# Loosen the raw per-chain bounds the same way the optimizer would (widen the
-# σ ceiling and ρ window) so the defaults shown here are not pre-capped.
-_bnds = (
-    _loosen_data_driven_bounds(_dd["bounds"])
-    if "warning" not in _diag else _dd["bounds"]
-)
-
-if "warning" in _diag:
-    st.warning(
-        f"Limited data: {_diag['warning']} Showing static defaults — review and edit below."
-    )
-else:
-    st.caption(
-        f"From surface — liquid maturities: {_diag.get('n_liquid_maturities')} "
-        f"(T {_diag.get('T_short', float('nan')):.3f} → {_diag.get('T_long', float('nan')):.3f}) · "
-        f"ATM IV {_diag.get('sigma_atm_short', float('nan'))*100:.1f}% → "
-        f"{_diag.get('sigma_atm_long', float('nan'))*100:.1f}% · "
-        f"smile slope b={_diag.get('smile_slope_b', 0.0):+.3f} · "
-        f"curvature c={_diag.get('smile_curvature_c', 0.0):+.4f}"
-    )
+_ig = DEFAULT_INITIAL_GUESS.as_tuple()
+_bnds = DEFAULT_BOUNDS
 
 _editor_seed = pd.DataFrame({
     "Parameter":     [m[0] for m in _PARAM_META],
@@ -193,7 +214,7 @@ _editor_seed = pd.DataFrame({
 })
 edited_params = st.data_editor(
     _editor_seed,
-    key=f"param_editor_v{ss.get('dd_version', 0)}",
+    key="param_editor",
     hide_index=True,
     use_container_width=True,
     disabled=["Parameter", "Meaning"],
@@ -239,32 +260,45 @@ def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
     )
     if cal_df is not None and not cal_df.empty:
         with st.expander("Calibration universe", expanded=False):
-            show_cols = [c for c in ["maturity", "type", "strike", "T",
-                                      "moneyness", "mid_price", "market_iv"]
+            # When de-Americanized, show the raw American quote alongside the
+            # European-equivalent target and the de-Americanized IV (σ*).
+            show_cols = [c for c in ["maturity", "type", "strike", "T", "moneyness",
+                                      "mid_price_market", "mid_price", "deam_iv", "market_iv"]
                          if c in cal_df.columns]
-            st.dataframe(
-                cal_df[show_cols].sort_values(["maturity", "strike"]),
-                hide_index=True, use_container_width=True,
-            )
+            display_df = cal_df[show_cols].sort_values(["maturity", "strike"])
+            if "mid_price_market" in show_cols:
+                display_df = display_df.rename(columns={
+                    "mid_price_market": "amer_quote",
+                    "mid_price": "euro_equiv",
+                    "deam_iv": "deam_iv (σ*)",
+                    "market_iv": "euro_iv",
+                })
+            st.dataframe(display_df, hide_index=True, use_container_width=True)
 
-# ── Three method columns ──────────────────────────────────────────────────────
+# ── Calibration ───────────────────────────────────────────────────────────────
 st.divider()
-col_a, col_b, col_c = st.columns(3)
 cal: dict = ss.get("calibration", {})
 
-# ── Column A: European Proxy ──────────────────────────────────────────────────
-with col_a:
-    st.markdown("### European Proxy")
-    st.caption("Prices American options as European. Fast — good for initial calibration.")
+col_main, _spacer = st.columns([3, 2])
+with col_main:
+    st.markdown("### Characteristic-Function Calibration")
+    st.caption(
+        "Quotes are de-Americanized to European-equivalent prices upstream (in the "
+        "**Filter** step, via a Black-Scholes binomial tree that strips the early-exercise "
+        "premium), so the fit targets the European-equivalent surface directly. The five "
+        "Heston parameters are then fit with the fast characteristic-function pricer and "
+        "the Levenberg-Marquardt optimiser (Cui et al. 2016), vega-weighted — no American "
+        "pricer in the loop."
+    )
 
-    if st.button("Calibrate — European Proxy", type="primary", key="btn_ep"):
-        with st.spinner("Calibrating with European Proxy …"):
+    if st.button("Calibrate", type="primary", key="btn_ep"):
+        with st.spinner("Calibrating …"):
             try:
                 result, cal_df = _run_calibration(
-                    "european_proxy", shared_guess, shared_bounds, Ns=40, Nv=20, Nt=40
+                    "european_proxy", shared_guess, shared_bounds, Ns=40, Nv=20, Nt=40,
                 )
                 meta = result.as_dict()
-                meta["method_label"] = "European Proxy"
+                meta["method_label"] = "Characteristic-Function"
                 if "calibration" not in ss:
                     ss["calibration"] = {}
                 ss["calibration"]["european_proxy"] = {"meta": meta, "df": cal_df}
@@ -278,102 +312,10 @@ with col_a:
     else:
         st.info("Not yet calibrated.")
 
-# ── Column B: PDE Solver ──────────────────────────────────────────────────────
-with col_b:
-    st.markdown("### PDE Solver")
-    st.caption("Solves the Heston PDE on a finite-difference grid. Accurate for early-exercise premium.")
-
-    b1, b2, b3 = st.columns(3)
-    Ns_pde = b1.number_input("Ns (stock steps)", min_value=5, max_value=200, value=40, step=5, key="Ns_pde",
-                              help="Number of stock-price grid points in the PDE.")
-    Nv_pde = b2.number_input("Nv (var steps)",   min_value=5, max_value=200, value=20, step=5, key="Nv_pde",
-                              help="Number of variance grid points in the PDE.")
-    Nt_pde = b3.number_input("Nt (time steps)",  min_value=5, max_value=200, value=40, step=5, key="Nt_pde",
-                              help="Number of time steps in the PDE.")
-
-    if st.button("Calibrate — PDE Solver", type="primary", key="btn_pde"):
-        with st.spinner("Calibrating with PDE Solver — this may take several minutes …"):
-            try:
-                result, cal_df = _run_calibration(
-                    "pde", shared_guess, shared_bounds,
-                    Ns=int(Ns_pde), Nv=int(Nv_pde), Nt=int(Nt_pde)
-                )
-                meta = result.as_dict()
-                meta["method_label"] = "PDE Solver"
-                if "calibration" not in ss:
-                    ss["calibration"] = {}
-                ss["calibration"]["pde"] = {"meta": meta, "df": cal_df}
-                st.success("Done.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Calibration failed: {e}")
-
-    if "pde" in cal:
-        _render_result(cal["pde"]["meta"], cal["pde"].get("df"))
-    else:
-        st.info("Not yet calibrated.")
-
-# ── Column C: LSMC ───────────────────────────────────────────────────────────
-with col_c:
-    st.markdown("### LSMC Simulation")
-    st.caption("Longstaff-Schwartz Monte Carlo. Most flexible; highest variance per run.")
-
-    c1, c2 = st.columns(2)
-    Ns_lsmc = c1.number_input("Paths (Ns)", min_value=100, max_value=50000, value=1000, step=100,
-                               key="Ns_lsmc",
-                               help="Number of Monte Carlo paths. More paths = more accurate but slower.")
-    Nt_lsmc = c2.number_input("Time steps (Nt)", min_value=10, max_value=500, value=50, step=10,
-                               key="Nt_lsmc",
-                               help="Number of time discretisation steps per path.")
-
-    if st.button("Calibrate — LSMC", type="primary", key="btn_lsmc"):
-        with st.spinner("Calibrating with LSMC — this may take several minutes …"):
-            try:
-                result, cal_df = _run_calibration(
-                    "lsmc", shared_guess, shared_bounds, Ns=int(Ns_lsmc), Nv=20, Nt=int(Nt_lsmc)
-                )
-                meta = result.as_dict()
-                meta["method_label"] = "LSMC Simulation"
-                if "calibration" not in ss:
-                    ss["calibration"] = {}
-                ss["calibration"]["lsmc"] = {"meta": meta, "df": cal_df}
-                st.success("Done.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Calibration failed: {e}")
-
-    if "lsmc" in cal:
-        _render_result(cal["lsmc"]["meta"], cal["lsmc"].get("df"))
-    else:
-        st.info("Not yet calibrated.")
-
-# ── Comparison table (shown when ≥ 2 methods done) ───────────────────────────
-if len(cal) >= 2:
-    st.divider()
-    st.subheader("Parameter comparison across methods")
-    _LABELS = {
-        "european_proxy": "European Proxy",
-        "pde": "PDE Solver",
-        "lsmc": "LSMC Simulation",
-    }
-    rows = []
-    for code, label in _LABELS.items():
-        if code not in cal:
-            continue
-        meta = cal[code]["meta"]
-        feller = 2 * meta["kappa"] * meta["theta"] - meta["sigma"] ** 2
-        rows.append({
-            "Method":        label,
-            "v₀":            round(meta["v0"],    6),
-            "κ":             round(meta["kappa"], 4),
-            "θ̄":             round(meta["theta"], 6),
-            "σ":             round(meta["sigma"], 4),
-            "ρ":             round(meta["rho"],   4),
-            "Feller 2κθ−σ²": round(feller,        4),
-            "Loss":          f"{meta['loss']:.4e}",
-            "Runtime (s)":   round(meta["runtime_seconds"], 1),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+st.caption(
+    "American-option pricing (PDE / LSMC) lives on the **Price Contracts** page — "
+    "calibration is decoupled from pricing."
+)
 
 # ── Navigation ────────────────────────────────────────────────────────────────
 st.divider()

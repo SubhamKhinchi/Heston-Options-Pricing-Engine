@@ -1,3 +1,11 @@
+"""
+Strategy Lab.
+
+Builds multi-leg option strategies from the analytics chain (strategies/*),
+charts their payoff/P&L and net greeks, and stashes the strategy summary for the
+Risk Dashboard. Upstream: the analytics chain; Downstream: Risk Dashboard.
+"""
+
 from __future__ import annotations
 
 import sys

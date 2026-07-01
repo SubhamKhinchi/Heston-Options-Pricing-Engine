@@ -1,3 +1,11 @@
+"""
+Risk Dashboard.
+
+Evaluates the latest strategy (from Strategy Lab) against risk limits and a
+spot/vol/time scenario table (risk/engine). Upstream: Strategy Lab summary in
+session state. The only page that still imports app/shared.configure_page.
+"""
+
 from __future__ import annotations
 
 import sys

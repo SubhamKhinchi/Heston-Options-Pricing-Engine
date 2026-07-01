@@ -1,3 +1,14 @@
+"""
+Market-data service: the single entry point for loading and filtering chains.
+
+Loads raw chains (data/market_data.py), normalises them (analytics/schema), stamps
+per-row dividend yield and rate, and applies liquidity filters (data/option_filters),
+returning the cleaned frame plus drop statistics.
+
+Position in the pipeline: Market Data -> [MarketService] -> AnalyticsService /
+CalibrationService / PricingService.
+"""
+
 from __future__ import annotations
 
 from typing import Iterable
@@ -5,6 +16,7 @@ from typing import Iterable
 import pandas as pd
 
 from analytics.schema import ensure_option_frame
+from calibration.de_americanize import add_deamericanized_columns
 from config.market_config import interpolate_rate
 from data.option_filters import apply_filters
 
@@ -41,6 +53,24 @@ def load_live_chain(tickers: Iterable[str]) -> pd.DataFrame:
     return get_multiple_tickers(parse_tickers(tickers))
 
 
+def europeanize_chain(filtered_df: pd.DataFrame) -> pd.DataFrame:
+    """Post-filter normalization: stamp European-equivalent prices on the chain.
+
+    Adds `euro_mid` (the de-Americanized, European-equivalent mid) and `deam_iv`
+    (the de-Americanized implied vol σ*). This is the single, always-on de-Americanization
+    step for the whole pipeline — calibration and analytics both consume these columns,
+    so the market side is uniformly European-equivalent and comparable to the European
+    Heston model. Run once, after liquidity filtering (so only the survivors pay the
+    binomial-inversion cost, and the filters still see the real American quotes).
+
+    Not a user choice: this project is a European-equivalent engine, so the conversion
+    is mandatory. Per-row `r`/`q` (stamped by filter_chain_with_stats) are used.
+    """
+    if filtered_df is None or filtered_df.empty:
+        return filtered_df
+    return add_deamericanized_columns(filtered_df)
+
+
 def filter_chain_with_stats(
     raw_df: pd.DataFrame,
     *,
@@ -52,6 +82,7 @@ def filter_chain_with_stats(
     option_types: tuple[str, ...] | None = None,
     min_volume: int = 0,
     min_open_interest: int = 0,
+    min_maturity: float | None = 7.0 / 365.0,   # drop contracts expiring within ~1 week
     max_maturity: float | None = None,
     max_contracts: int | None = None,
     moneyness_lo: float = 0.8,
@@ -76,6 +107,7 @@ def filter_chain_with_stats(
         option_types=option_types,
         min_volume=min_volume,
         min_open_interest=min_open_interest,
+        min_maturity=min_maturity,
         max_maturity=max_maturity,
         max_contracts=max_contracts,
         moneyness_lo=moneyness_lo,
@@ -87,4 +119,8 @@ def filter_chain_with_stats(
             filtered_df["r"] = filtered_df["T"].map(lambda T: interpolate_rate(rate_curve, T))
         else:
             filtered_df["r"] = r
+    # Post-filter normalization: stamp European-equivalent prices (euro_mid, deam_iv)
+    # once, here, so every downstream consumer (calibration, analytics) sees a uniformly
+    # European-equivalent market side. Always on — see europeanize_chain.
+    filtered_df = europeanize_chain(filtered_df)
     return filtered_df, stats

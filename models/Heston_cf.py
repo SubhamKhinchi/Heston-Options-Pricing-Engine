@@ -1,5 +1,13 @@
-# Legacy Heston characteristic function — retained for use by heston_european.py.
-# For new code, prefer models/heston_cf_cui.py (numerically stable, Cui et al. 2016).
+"""
+Legacy Heston characteristic function (textbook two-term form).
+
+Retained only because models/heston_european.py (the quad-based European pricer
+used for the American no-dividend short-circuit and LSMC reference) depends on it.
+For new code — and all calibration — prefer models/heston_cf_cui.py, which is
+numerically continuous for long maturities and analytically differentiable
+(Cui et al. 2016).
+"""
+
 import numpy as np
 from scipy.integrate import quad
 

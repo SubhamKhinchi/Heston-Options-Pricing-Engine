@@ -1,3 +1,18 @@
+"""
+Option-chain analytics enrichment.
+
+`enrich_option_chain()` takes a normalised chain and adds the analytics columns:
+market implied vol (Newton/Brent inversion), Black-Scholes greeks from market IV,
+liquidity score, intrinsic/time value, and — when Heston parameters are supplied —
+model prices, model IV/greeks, and mispricing metrics (price_error, iv_error).
+
+Upstream:   analytics/schema.ensure_option_frame; optional Heston params from
+            services/calibration_service.py; model prices via
+            services/pricing_service.price_option_frame.
+Downstream: services/analytics_service.py and the app pages (Option Chain,
+            Volatility Surface, Mispricing Screener).
+"""
+
 from __future__ import annotations
 
 from typing import Iterable
@@ -7,6 +22,7 @@ import pandas as pd
 
 from analytics.greeks import black_scholes_greeks
 from analytics.schema import ensure_option_frame
+from calibration.de_americanize import add_deamericanized_columns
 from calibration.implied_vol import implied_volatility
 from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters, price_option_frame
@@ -109,16 +125,15 @@ def enrich_option_chain(
     df["time_value"] = df["mid_price"] - df["intrinsic_value"]
     df["liquidity_score"] = compute_liquidity_score(df)
 
-    if "market_iv" not in df.columns:
-        df["market_iv"] = df.apply(_implied_vol_for_row, axis=1, args=("mid_price", r, q))
-    else:
-        missing_market_iv = df["market_iv"].isna()
-        if missing_market_iv.any():
-            df.loc[missing_market_iv, "market_iv"] = df.loc[missing_market_iv].apply(
-                _implied_vol_for_row,
-                axis=1,
-                args=("mid_price", r, q),
-            )
+    # Market IV is the DE-AMERICANIZED (European-equivalent) implied vol, so it is
+    # directly comparable to the European Heston model IV computed below. The columns
+    # `euro_mid` (European-equivalent price) and `deam_iv` (sigma*) are normally
+    # stamped once upstream (the post-filter europeanize stage, services/market_service);
+    # compute them here only if a caller passed a frame without them, so this function
+    # stays correct in isolation and never double-de-Americanizes.
+    if "euro_mid" not in df.columns or "deam_iv" not in df.columns:
+        df = add_deamericanized_columns(df, r=r, q=q)
+    df["market_iv"] = df["deam_iv"]
 
     market_greeks = df.apply(_greeks_from_iv, axis=1, args=("market_iv", "market", r, q))
     df = pd.concat([df, market_greeks], axis=1)
@@ -128,16 +143,19 @@ def enrich_option_chain(
         df["model_price"] = df["calibrated_heston_price"]
 
     if compute_model_prices and heston_params is not None:
+        # The model surface is European-equivalent (to match the de-Americanized
+        # market IV), so price every contract as European Heston via the closed form.
+        # American pricing (PDE/LSMC) is a separate concern on the Price Contracts page.
+        # (Ns/Nv/Nt are accepted for API compatibility but unused on the European path.)
+        european_df = df.copy()
+        european_df["ExerciseStyle"] = "european"
         df["model_price"] = price_option_frame(
-            df,
+            european_df,
             r=r,
             q=q,
             heston_params=heston_params,
             rate_curve=rate_curve,
             pricing_limit=pricing_limit,
-            Ns=Ns,
-            Nv=Nv,
-            Nt=Nt,
         )
 
     if "model_price" in df.columns:
@@ -145,10 +163,13 @@ def enrich_option_chain(
         model_greeks = df.apply(_greeks_from_iv, axis=1, args=("model_iv", "model", r, q))
         df = pd.concat([df, model_greeks], axis=1)
         df["model_abs_delta"] = df["model_delta"].abs()
-        df["price_error"] = df["model_price"] - df["mid_price"]
+        # Compare like-for-like: European model price vs the European-equivalent
+        # (de-Americanized) market price, so the early-exercise premium does not
+        # masquerade as a model-vs-market dislocation.
+        df["price_error"] = df["model_price"] - df["euro_mid"]
         df["iv_error"] = df["model_iv"] - df["market_iv"]
         with np.errstate(divide="ignore", invalid="ignore"):
-            df["relative_price_error"] = df["price_error"] / df["mid_price"]
+            df["relative_price_error"] = df["price_error"] / df["euro_mid"]
         df["abs_iv_error"] = df["iv_error"].abs()
         df["mispricing_score"] = df["abs_iv_error"] * (1.0 + df["liquidity_score"] / 100.0)
         df["mispricing_bias"] = np.where(

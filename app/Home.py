@@ -1,3 +1,12 @@
+"""
+Streamlit landing page for the Heston options analytics app.
+
+Introduces the step-by-step pipeline and links to the page flow:
+Fetch Data -> Filter Options -> Calibrate Heston -> Price Contracts ->
+Volatility Surface -> Strategy Lab -> Risk Dashboard -> Mispricing Screener.
+Each page under app/pages/ is self-contained. Run with `streamlit run app/Home.py`.
+"""
+
 from __future__ import annotations
 
 import sys
@@ -23,9 +32,7 @@ st.caption(
 ss = st.session_state
 
 _METHOD_LABELS = {
-    "european_proxy": "European Proxy",
-    "pde":            "PDE Solver",
-    "lsmc":           "LSMC Simulation",
+    "european_proxy": "Characteristic-Function",
 }
 
 

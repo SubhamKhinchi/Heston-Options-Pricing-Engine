@@ -15,7 +15,11 @@ Stopping tolerances mirror the paper: ε₁ = ε₂ = ε₃ = 1e-10.
 import numpy as np
 from scipy.optimize import least_squares
 
-from calibration.heston_loss_function import heston_residuals, heston_jacobian
+from calibration.heston_loss_function import (
+    heston_residuals,
+    heston_jacobian,
+    compute_residual_weights,
+)
 
 
 # Default parameter bounds matching the paper's validation ranges
@@ -39,6 +43,7 @@ def calibrate_heston(
     bounds=None,
     objective="price",        # kept for API compatibility; LM always uses price residuals
     pricing_mode="european_proxy",
+    weight_scheme="vega",     # residual weighting: "vega" | "none" | "inv_spread"
 ):
     """
     Calibrate Heston parameters via Levenberg-Marquardt (Cui et al., 2016).
@@ -53,6 +58,8 @@ def calibrate_heston(
                       or None to use the defaults above
     objective       : ignored (kept for backward-compatible call sites)
     pricing_mode    : "european_proxy" (default) or "auto"
+    weight_scheme   : residual weighting — "vega" (default; approximate IV-space
+                      fit), "none" (plain price residuals), or "inv_spread"
 
     Returns
     -------
@@ -65,8 +72,14 @@ def calibrate_heston(
         lb = [b[0] for b in bounds]
         ub = [b[1] for b in bounds]
 
+    # Per-contract residual weights, computed once from market data (constant in
+    # the parameters, so the analytic Jacobian below stays exact). "vega" makes the
+    # price-residual fit behave like an IV-space fit — near-intrinsic high-price
+    # contracts no longer dominate the deep-OTM wings that carry skew/curvature.
+    weights = compute_residual_weights(option_df, weight_scheme, r, q)
+
     # Shared args tuple passed to residuals and Jacobian
-    extra = (r, q, option_df, Ns, Nv, Nt, pricing_mode)
+    extra = (r, q, option_df, Ns, Nv, Nt, pricing_mode, weights)
 
     def residuals_fn(params):
         return heston_residuals(params, *extra)

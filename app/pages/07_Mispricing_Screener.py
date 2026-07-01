@@ -1,3 +1,11 @@
+"""
+Mispricing Screener.
+
+Ranks contracts by model-vs-market dislocation (strategies/screener) using the
+calibrated Heston model IV against the (de-Americanized) market IV, and can pull
+historical-data parameter sanity checks. Upstream: calibration + analytics.
+"""
+
 from __future__ import annotations
 
 import sys

@@ -2,6 +2,25 @@
 
 A full-stack quantitative finance platform for pricing, calibrating, and analyzing options under the Heston stochastic volatility model. The system covers everything from raw market data ingestion to real-time volatility surface visualization, strategy payoff construction, and risk limit evaluation — all accessible through a multi-page Streamlit web app or headless CLI pipelines.
 
+> **Architecture note (current state).** The calibration and pricing core have been
+> rewritten since this document was first authored. The engine is now a
+> **European-equivalent** pipeline:
+> - Data is **live-only** (Yahoo Finance); the old `nvda_vol.xlsx` sample mode and the
+>   `--source` CLI flag have been removed.
+> - The implied **forward curve** `F(T)` (from put-call parity) is carried instead of a
+>   dividend yield; the risk-free rate comes from a **SOFR/OIS curve** (`config/market_config.py`).
+> - American quotes are **de-Americanized** once, up front, into European-equivalent prices
+>   (`calibration/de_americanize.py`).
+> - Calibration uses **Levenberg-Marquardt with an analytic Jacobian** (Cui et al. 2016) over a
+>   **64-node Gauss-Legendre** characteristic-function pricer (`pricing/european_gl.py`,
+>   `models/heston_cf_cui.py`) — **not** the L-BFGS-B / IV-MSE approach described in some
+>   sections below.
+> - The Streamlit app is an **8-page, self-contained, step-by-step pipeline** using
+>   `st.session_state`; the centralized sidebar/cache layer was retired.
+>
+> Sections 7, 9, 14–17 and 19 reflecting the older design are being migrated. For the
+> authoritative current overview see `DOCS.md` and `CLAUDE.md`.
+
 ---
 
 ## Table of Contents
@@ -114,12 +133,12 @@ Implemented in [models/Heston_cf.py](models/Heston_cf.py).
 ┌──────────────────────┐        ┌──────────────────────────────┐
 │  calibration/        │        │  services/pricing_service    │
 │  calibrate_heston.py │        │  price_option_frame()        │
-│  L-BFGS-B optimizer  │        │                              │
-│  + loss function     │        │  European: Fourier           │
-└──────────┬───────────┘        │  American call (no div):     │
-           │                    │    European proxy            │
-           │ fitted params      │  American (general):         │
-           │                    │    PDE or LSMC               │
+│  Levenberg-Marquardt │        │                              │
+│  + analytic Jacobian │        │  All contracts priced as     │
+└──────────┬───────────┘        │  European-equivalent:        │
+           │                    │  GL quad (Cui CF), carry q   │
+           │ fitted params      │  (American = European-equiv; │
+           │                    │   no PDE/LSMC)               │
            ▼                    └──────────────┬───────────────┘
 ┌──────────────────────┐                       │
 │  services/           │◄──────────────────────┘
@@ -155,8 +174,9 @@ Implemented in [models/Heston_cf.py](models/Heston_cf.py).
                                 ▼
           ┌──────────────────────────────────────────────────┐
           │                app/  (Streamlit)                 │
-          │   Home -> Option Chain -> Vol Surfaces ->        │
-          │   Strategy Lab -> Risk Dashboard -> Mispricing   │
+          │   Fetch -> Filter -> Calibrate -> Price ->       │
+          │   Vol Surface -> Strategy Lab -> Risk ->         │
+          │   Mispricing Screener   (8 self-contained pages) │
           └──────────────────────────────────────────────────┘
 ```
 
@@ -168,25 +188,23 @@ Implemented in [models/Heston_cf.py](models/Heston_cf.py).
 Heston-Options-Pricing-Engine/
 │
 ├── models/                       # Pure mathematical models
-│   ├── Heston_cf.py              # Heston characteristic function
-│   ├── heston_european.py        # Fourier-inversion European pricing
+│   ├── heston_cf_cui.py          # Cui (2016) CF + analytic gradient (active)
+│   ├── Heston_cf.py              # Legacy classic Heston characteristic function
+│   ├── heston_european.py        # Legacy Fourier-inversion (scipy quad) European pricing
 │   └── black_scholes.py          # BS price with continuous dividend yield
 │
-├── pricing/                      # Pricing wrappers by exercise type
-│   ├── european.py               # Heston European call/put wrappers
-│   ├── american.py               # American put/call dispatch (LSMC or European proxy)
-│   └── heston_pde_american.py    # Explicit finite-difference PDE solver
-│
-├── simulation/                   # Monte Carlo path generation
-│   ├── heston_path.py            # Full-truncation Euler + log-Euler Heston paths
-│   └── lsmc.py                   # Longstaff-Schwartz backward regression
+├── pricing/                      # European-equivalent pricing engine
+│   ├── european_gl.py            # The engine: GL-quadrature European + analytic gradient
+│   └── european.py               # Thin wrappers (delegate to european_gl)
+│                                 # (American PDE/LSMC/C++ pricers removed → _graveyard.py)
 │
 ├── calibration/                  # Parameter estimation
-│   ├── calibrate_heston.py       # scipy L-BFGS-B optimizer entry point
-│   ├── heston_loss_function.py   # MSE loss (price or IV objective)
+│   ├── calibrate_heston.py       # Levenberg-Marquardt (trf) entry point
+│   ├── heston_loss_function.py   # Residuals + analytic Jacobian + vega weighting
+│   ├── de_americanize.py         # CRR-tree de-Americanization (euro_mid, deam_iv)
 │   ├── implied_vol.py            # Brent-method BS IV inversion
-│   ├── data_driven_bounds.py     # IV-surface-based initial guess and bounds
-│   └── historical_bounds.py      # AR(1)-realized-variance-based P-measure estimates
+│   ├── data_driven_bounds.py     # IV-surface-based guess/bounds (tool, not default)
+│   └── historical_bounds.py      # AR(1)-realized-variance P-measure estimates (tool)
 │
 ├── analytics/                    # Option chain enrichment
 │   ├── schema.py                 # ensure_option_frame() normalization gate
@@ -196,8 +214,9 @@ Heston-Options-Pricing-Engine/
 │
 ├── data/                         # Market data ingestion and filtering
 │   ├── market_data.py            # yfinance option chain fetcher
-│   ├── option_filters.py         # 11-step filter pipeline
-│   └── cleaning.py               # Data cleaning utilities
+│   ├── forward_curve.py          # Implied forward F(T) from put-call parity
+│   ├── instrument_classifier.py  # EQUITY / ETF / INDEX → exercise style
+│   └── option_filters.py         # 11-step filter pipeline
 │
 ├── services/                     # Business logic orchestration layer
 │   ├── market_service.py         # Load + filter chains; single data entry point
@@ -222,32 +241,30 @@ Heston-Options-Pricing-Engine/
 │   ├── Home.py                   # Landing page; raw/filtered chain explorer
 │   ├── shared.py                 # Sidebar controls, @st.cache_data wrappers
 │   └── pages/
-│       ├── 1_Option_Chain.py         # Per-contract metrics + Greeks table
-│       ├── 2_Volatility_Surfaces.py  # 3-D IV and Greek surfaces
-│       ├── 3_Strategy_Lab.py         # Multi-leg strategy builder + payoff chart
-│       ├── 4_Risk_Dashboard.py       # Limit checks + scenario table
-│       └── 5_Mispricing_Screener.py  # IV-error screener + RV strategy ideas
+│       ├── 01_Fetch_Data.py          # Step 1: live chain + SOFR/OIS curve
+│       ├── 02_Filter_Options.py      # Step 2: filter + de-Americanize
+│       ├── 03_Calibrate_Heston.py    # Step 3: vega-weighted LM calibration
+│       ├── 04_Price_Contracts.py     # Step 4: model pricing + analytics table
+│       ├── 05_Volatility_Surface.py  # Step 5: 3-D IV and Greek surfaces
+│       ├── 06_Strategy_Lab.py        # Step 6: multi-leg builder + payoff chart
+│       ├── 4_Risk_Dashboard.py       # Step 7: limit checks + scenario table
+│       └── 07_Mispricing_Screener.py # Step 8: IV-error screener + RV ideas
 │
 ├── pipelines/                    # Headless CLI scripts
 │   ├── run_pricing.py            # Build analytics table from chain snapshot
 │   └── run_calibration.py        # Calibrate and dump JSON
 │
 ├── config/
-│   └── market_config.py          # Global constants (r, q, MC paths)
+│   └── market_config.py          # SOFR/OIS discount curve (FRED + Treasury)
 │
-├── utils/
-│   ├── discounting.py            # Discounting helpers
-│   └── regression.py             # LSMC basis function utilities
+├── utils/                        # Jupyter research notebooks (calibration experiments)
 │
 ├── results/
 │   └── calibrations/             # Persisted calibration JSON files (auto-created)
 │
-├── vol surface app/
-│   └── vol_surface.py            # Standalone volatility surface Streamlit app
-│
-├── nvda_vol.xlsx                 # Sample NVDA option chain snapshot
 ├── requirements.txt
-└── CLAUDE.md
+├── DOCS.md                       # Concise current-state overview
+└── CLAUDE.md                     # Developer/architecture guide
 ```
 
 ---
@@ -286,7 +303,7 @@ sudo apt-get update && sudo apt-get install -y python3-venv
 
 | Package | Role |
 |---------|------|
-| `numpy` | Numerical arrays, Monte Carlo paths |
+| `numpy` | Numerical arrays, Gauss-Legendre quadrature, vectorized math |
 | `scipy` | Fourier integration (`quad`), optimization (`minimize`), root-finding (`brentq`), interpolation (`griddata`) |
 | `pandas` | DataFrame-based option chain representation |
 | `yfinance` | Live option chain and historical price downloads |
@@ -310,9 +327,32 @@ sudo apt-get update && sudo apt-get install -y python3-venv
 
 `get_multiple_tickers(tickers)` loops over a list of tickers and concatenates results.
 
-### Sample Data
+> **Live-only.** There is no bundled sample snapshot. The previous `nvda_vol.xlsx` sample mode
+> and the `--source` CLI flag have been removed; all entry points fetch live chains.
 
-`nvda_vol.xlsx` is a pre-downloaded NVDA option chain snapshot. It is loaded by the services layer via `openpyxl` and passed through `ensure_option_frame()` before any analytics are run.
+### Implied Forward Curve — `data/forward_curve.py`
+
+For each expiry, the implied forward `F(T)` is recovered from European put-call parity by
+regressing `C − P` on `K` across the near-ATM strikes: slope = `−e^{-rT}`, intercept = `e^{-rT}·F`.
+The forward — not a dividend yield — is the object option prices actually depend on, and it is
+exercise-style-independent. The near-ATM window keeps the (American) early-exercise premium
+negligible, a sanity clamp rejects economically impossible fits (falling back to the no-dividend
+forward `S·e^{rT}`), and the implied `q = r − ln(F/S)/T` is exposed only as a diagnostic. This
+breaks the chicken-and-egg with the downstream forward-based filter.
+
+### Instrument Classification — `data/instrument_classifier.py`
+
+Classifies a ticker EQUITY / ETF / INDEX (override maps → `^` prefix → yfinance `quoteType` →
+default EQUITY). Cash-settled indices (SPX, NDX, …) are European; ETFs and single names are
+American. Every instrument is priced with a *continuous* dividend yield (the implied forward
+bakes discrete cash dividends into one effective rate), so there is no discrete-cashflow path.
+
+### Discount Rates — `config/market_config.py`
+
+A **SOFR/OIS** discount curve (FRED SOFR compound averages short end, US Treasury on-the-run
+yields long end) is built and cached hourly; `interpolate_rate(curve, T)` interpolates log-linearly
+in discount factors. Per-row `r` is stamped by maturity; a flat 4.5% fallback applies if all
+network calls fail.
 
 ### Filtering — `data/option_filters.py`
 
@@ -380,115 +420,55 @@ Model columns (when Heston params provided):
 
 ## 7. Pricing Methods
 
-### 7.1 European Options — Fourier Inversion
+### 7.1 European Options — Gauss-Legendre Quadrature (Cui CF)
 
-**File:** [models/heston_european.py](models/heston_european.py)
+**Primary file:** [pricing/european_gl.py](pricing/european_gl.py) using [models/heston_cf_cui.py](models/heston_cf_cui.py)
 
-The Heston European price uses the Gil-Pelaez inversion of the characteristic function:
-
-```
-Call = S0 * P1 - K * exp(-r*T) * P2
-Put  = K * exp(-r*T) * (1 - P2) - S0 * (1 - P1)
-
-P_j = 0.5 + (1/pi) * integral_0^100 [ Re( exp(-i*u*ln(K)) * phi_j(u) / (i*u) ) ] du
-```
-
-The integral is evaluated with `scipy.integrate.quad` over `[0, 100]`.
-
-This is the primary engine for all fast/European pricing. It is exact up to numerical integration tolerance with no discretization error.
-
-### 7.2 American Call (No Dividends)
-
-By the early exercise premium result, an American call on a non-dividend-paying asset equals a European call in value. [pricing/american.py](pricing/american.py) routes such contracts directly to the Fourier inversion pricer.
-
-### 7.3 American Options — Explicit Finite-Difference PDE
-
-**File:** [pricing/heston_pde_american.py](pricing/heston_pde_american.py)
-
-For American options with dividends (or puts), the two-factor Heston PDE is solved on a `(S, v)` grid via explicit forward Euler time-stepping:
+The current European engine uses the **Cui et al. (2016)** characteristic function — numerically
+continuous for long maturities (no branch-switching discontinuities) and analytically
+differentiable — evaluated by **64-node Gauss-Legendre quadrature** truncated at `ū = 200`:
 
 ```
-dV/dt = (r-q)*S * dV/dS
-      + kappa*(theta-v) * dV/dv
-      + 0.5*v*S^2 * d2V/dS2
-      + 0.5*sigma^2*v * d2V/dv2
-      + rho*sigma*v*S * d2V/(dS dv)
-      - r*V
+Call = ½·(S0·e^{-qT} − K·e^{-rT}) + e^{-rT}/π · (I1 − K·I2)
+
+I1 = ∫_0^ū Re[ K^{-iu}/(iu) · φ(u − i) ] du      I2 = ∫_0^ū Re[ K^{-iu}/(iu) · φ(u) ] du
+Put = Call − S0·e^{-qT} + K·e^{-rT}              (put-call parity)
 ```
 
-Grid setup:
-- `S` in `[0, 3*S0]` with `Ns` steps; `v` in `[0, 1.0]` with `Nv` steps; `Nt` time steps backwards from expiry.
-- Central differences for first- and second-order spatial derivatives.
-- Mixed cross-derivative via four-corner stencil: `(V[i+1,j+1] - V[i+1,j-1] - V[i-1,j+1] + V[i-1,j-1]) / (4*dS*dv)`.
-- American constraint applied at each time step: `V[i,:] = max(V[i,:], payoff(S_i))`.
-- Final value interpolated at `(S0, v0)` from the grid.
+This achieves ~1e-8 accuracy for all standard maturities and — crucially for calibration —
+`heston_call_price_and_gradient()` returns the price **and** all five analytic gradient
+components in a single vectorized pass over the quadrature nodes (Cui Theorem 1 / Eq. 22). The
+continuous carry `q` (the implied-forward yield) enters only the price level, not the gradient.
 
-Default grid: `Ns = 40, Nv = 20, Nt = 40`.
+> The legacy classic-Heston CF (`models/Heston_cf.py`) with `scipy.integrate.quad` inversion
+> (`models/heston_european.py`) is retained but is no longer on the calibration path.
 
-### 7.4 American Options — LSMC (Longstaff-Schwartz)
+### 7.0 De-Americanization (pre-pricing market normalization)
 
-**Files:** [simulation/heston_path.py](simulation/heston_path.py), [simulation/lsmc.py](simulation/lsmc.py)
+**File:** [calibration/de_americanize.py](calibration/de_americanize.py)
 
-For American options requiring Monte Carlo, the engine:
+Because the fast CF pricer produces *European* prices, American market quotes are converted to
+European-equivalents once, after filtering: a CRR binomial tree backs out the constant vol σ*
+that reproduces the American price (the tree handles early exercise explicitly, so the premium
+does not leak into σ*), then a European BS price is taken at the same σ*. This adds `euro_mid`
+(European-equivalent mid) and `deam_iv` (σ*, the de-Americanized implied vol) — the single
+source of European-equivalent market vol used by both calibration and analytics.
 
-**Step 1 — Path simulation** (`heston_path.py`):
+### 7.2 American Options — Priced as European-Equivalent
 
-Generates `N` paths of `(S_t, v_t)` over `M` time steps using correlated Brownian increments:
+There is no dedicated American pricer. Because American quotes are de-Americanized once
+up front (§7.0) and the model is calibrated in European-equivalent space, every contract —
+European or American — is priced with the European GL engine of §7.1, carrying the
+continuous implied-forward yield `q`. `price_option_row()` in
+[services/pricing_service.py](services/pricing_service.py) therefore dispatches only by
+option type (call/put), not exercise style.
 
-```
-Correlated increments:
-  W1 = sqrt(dt) * Z1
-  W2 = sqrt(dt) * (rho * Z1 + sqrt(1 - rho^2) * Z2)
-  where Z1, Z2 ~ N(0,1) independently
-
-Variance (full-truncation Euler):
-  v[t+dt] = max(v[t] + kappa*(theta - v[t])*dt + sigma*sqrt(max(v[t],0))*W2, 0)
-
-Stock (log-Euler for positivity):
-  S[t+dt] = S[t] * exp( (r - q - 0.5*v[t])*dt + sqrt(max(v[t],0))*W1 )
-```
-
-Full truncation prevents negative variance by flooring at 0 before the square root; log-Euler ensures stock prices remain positive.
-
-Three variants handle: American put without dividends, American put with dividends (`q > 0`), American call with dividends.
-
-**Step 2 — Longstaff-Schwartz regression** (`lsmc.py`):
-
-Backward induction from expiry:
-
-```
-1. Terminal cashflow = max(K - S[:,-1], 0)  [for put]
-2. For each time step t = M-1 down to 1:
-   a. Identify in-the-money paths: ITM = S[:,t] < K
-   b. Skip if no ITM paths
-   c. Discount continuation values: Y = cashflow * exp(-r*dt)
-   d. Fit polynomial C(S) = polyfit(S[ITM], Y[ITM], degree=2)
-   e. Exercise if: payoff(S[ITM]) > C(S[ITM])
-   f. Update cashflows for exercised/held paths
-3. Final price = mean(cashflow * exp(-r*dt))
-```
-
-Defaults: `N = 10,000` paths, `M = 100` steps.
-
-### 7.5 Pricing Dispatch Logic
-
-`price_option_row()` in [services/pricing_service.py](services/pricing_service.py) routes each contract:
-
-```
-ExerciseStyle == "european"
-  -> Fourier inversion (call or put)
-
-ExerciseStyle == "american", call, q ~ 0
-  -> American call = European call (no early exercise premium without dividends)
-
-ExerciseStyle == "american", method="lsmc"
-  -> LSMC (call with dividends, or put with/without dividends)
-
-ExerciseStyle == "american" (default)
-  -> PDE solver (Ns x Nv x Nt grid)
-```
-
-In **fast calibration mode**, all contracts are treated as European regardless of exercise style, enabling much faster calibration inner loops.
+> **Removed (2026-06-27).** The earlier American pricers — the explicit finite-difference
+> PDE solver, the LSMC (Longstaff-Schwartz) Monte Carlo path, and the C++ MC kernel — were
+> removed. They were already unused in the live flow (analytics priced everything as
+> European; calibration always used the European proxy). The code is preserved in the
+> gitignored `_graveyard.py` at the repo root for future reference; a dedicated American
+> pricer is a planned later addition.
 
 ---
 
@@ -513,39 +493,82 @@ This function is used for computing **market IV** from observed mid-prices and f
 
 ### 9.1 Overview
 
-The calibration fits `(v0, kappa, theta, sigma, rho)` by minimizing a loss function over observed option prices or IVs using the L-BFGS-B optimizer from `scipy.optimize.minimize`.
+The calibration fits `(v0, kappa, theta, sigma, rho)` by **nonlinear least squares** on price
+residuals, following Cui et al. (2016):
 
-### 9.2 Loss Function — `calibration/heston_loss_function.py`
+```
+r_i(θ) = w_i · (C_model(θ; K_i, T_i) − C*_i)      f(θ) = ½ ‖r(θ)‖²
+```
 
-`heston_loss(params, r, q, options_df, Ns, Nv, Nt, objective, pricing_mode)`:
+solved with `scipy.optimize.least_squares(method='trf')` — the bounded equivalent of
+Levenberg-Marquardt. The decisive feature is an **analytic Jacobian**: the Cui CF gives
+`∂φ/∂θ_j = φ · h_j(u)`, so the same 64-node Gauss-Legendre quadrature that prices the option
+also returns all five gradient components in one pass (`pricing/european_gl.heston_call_price_and_gradient`).
+This is 10–16× faster than finite differences and far more stable than the previous
+L-BFGS-B / scalar-IV-MSE optimizer. Stopping tolerances mirror the paper (`ftol = gtol = xtol = 1e-10`).
 
-1. Guards against invalid parameters: negative variances or `|rho| >= 1` immediately return `1e10`.
-2. For each contract in the calibration universe:
-   - Computes the model price via `_model_price_from_row()` (routing to European proxy, American proxy, or PDE).
-   - **Price objective** (`objective = "price"`): `loss_i = ((P_model - P_market) / max(P_market, 1))^2`
-   - **IV objective** (`objective = "iv"`): `loss_i = (IV_model - IV_market)^2` where both IVs are computed via BS inversion.
-3. Returns mean squared error across all valid contracts. Returns `1e10` if no valid errors.
+> The `objective` argument is retained for backward compatibility but is ignored — LM always
+> minimizes (weighted) price residuals.
 
-### 9.3 Calibration Modes
+### 9.2 Residuals, Jacobian, and Weighting — `calibration/heston_loss_function.py`
 
-| Mode | Universe | Pricing | Objective | Use case |
-|------|----------|---------|-----------|----------|
-| **Fast** (recommended) | ATM calls only, European proxy | Fourier inversion | Price MSE | Real-time app; seconds |
-| **Full** | All calls + puts, all expiries | Correct exercise style (American PDE) | IV MSE | Overnight batch; accurate |
+- `heston_residuals(params, r, q, options_df, Ns, Nv, Nt, pricing_mode, weights)` builds the
+  residual vector `w_i · (price_i − market_i)`, plus one trailing **soft Feller penalty** term
+  `FELLER_WEIGHT · max(0, σ² − 2κθ)`.
+- `heston_jacobian(...)` returns the matching analytic Jacobian (Cui Theorem 1). Every
+  contract is priced as European-equivalent, so the gradient is always analytic.
+- `compute_residual_weights(...)` produces per-contract weights, normalized to mean 1:
+  - `"vega"` (default) — `1/vega` at market IV, making the price-space fit behave like an
+    IV-space fit so near-intrinsic high-price contracts don't dominate the skew-bearing wings.
+  - `"none"` — plain price residuals.
+  - `"inv_spread"` — `1/rel_spread`, trust tight markets more.
 
-In fast mode, `select_calibration_universe()` picks the `contracts_per_expiry` nearest-to-ATM contracts from up to `max_expiries` expiries (default 4 expiries × 4 contracts = 16 contracts), then overrides `ExerciseStyle = "european"` for all of them.
+  Weights are constant in the parameters, so the analytic Jacobian stays exact (each row is just scaled).
 
-Contract ranking within each expiry is by: ATM distance (ascending), rel_spread (ascending), volume (descending).
+**Feller penalty is OFF by default** (`FELLER_WEIGHT = 0.0`). High vol-of-vol relative to mean
+reversion is the empirical norm for single names (NVDA especially); enforcing `2κθ ≥ σ²` pins
+the fit to that boundary, forcing κ high and distorting σ/ρ. A synthetic recovery test (chain
+priced from known params with σ = 1.5 > 2κθ) recovered the truth to machine precision at
+weight 0 but failed at weight 50.
+
+### 9.3 Calibration Universe — "calibrate tight, price broad"
+
+`select_calibration_universe()` builds a deliberately tight fitting set off the
+already-europeanized chain:
+
+1. Maturity window + forward-moneyness band (`K/F`, the economically correct ATM measure).
+2. Optional open-interest floor.
+3. **OTM-only leg per strike** relative to the implied forward `F` (industry practice): the put
+   when `K < F`, the call when `K > F`. This drops the wide-spread, near-intrinsic ITM mirror,
+   removes early-exercise noise, and avoids double-counting the same IV from a call+put at one strike.
+4. Per-expiry near-ATM cap: rank by ATM distance (asc), rel_spread (asc), volume (desc), keep
+   `contracts_per_expiry` per expiry up to `max_expiries`.
+
+The calibration target is the **European-equivalent** price: `euro_mid` is used as `mid_price`
+and `deam_iv` (σ*) as `market_iv` (the raw American quote is preserved in `mid_price_market`).
+`ExerciseStyle` is forced to `"european"` so the analytic Jacobian is always available — no
+American pricer in the optimizer loop.
+
+The broad pricing/analytics layer, by contrast, runs over the full filtered chain.
 
 ### 9.4 Initial Guess and Bounds
 
-Three strategies provide the starting point for the optimizer:
+**Default (current path):** fixed search box and starting point following Cui et al. (2016),
+which deliberately calibrates "without any presumption on the values of the parameters" and
+shows the analytic-gradient LM converges from broad fixed ranges:
 
-**Static defaults** (fallback when data is insufficient):
 ```
-v0 = 0.04, kappa = 2.0, theta = 0.04, sigma = 0.5, rho = -0.7
-Bounds: v0/theta/sigma in [1e-4, 2], kappa in [1e-4, 10], rho in [-0.999, 0.999]
+Initial guess: v0 = 0.20, kappa = 1.20, theta = 0.20, sigma = 0.30, rho = -0.60
+Bounds: v0 ∈ [0.05, 0.95], kappa ∈ [0.50, 10.0], theta ∈ [0.05, 0.95],
+        sigma ∈ [0.05, 3.0], rho ∈ [-0.90, -0.10]
 ```
+
+The σ ceiling is raised to 3.0 (vs. the paper's 0.95) because high vol-of-vol single names
+need room; the Cui CF stays numerically stable well past 1.0. The initial guess is clamped
+into the box before the solve. Callers can override `bounds` / `initial_guess` per run.
+
+The two estimators below are available as **starting-point and sanity tools** but are **not**
+wired into the default calibration path:
 
 **Data-driven bounds** — `calibration/data_driven_bounds.py`:
 
@@ -583,20 +606,22 @@ The historical module also reports Feller condition status, AR(1) coefficients, 
 
 `calibrate_option_chain()` in [services/calibration_service.py](services/calibration_service.py):
 
-1. Calls `select_calibration_universe()` to pick the calibration subset.
-2. Computes market IVs for the calibration subset upfront.
-3. Runs `calibrate_heston()` (L-BFGS-B) and measures wall-clock runtime.
+1. Calls `select_calibration_universe()` to pick the OTM, near-ATM calibration subset (already
+   carrying European-equivalent `euro_mid` / `deam_iv`).
+2. Stamps per-row `r` from the OIS curve when a `rate_curve` is supplied.
+3. Runs `calibrate_heston()` (Levenberg-Marquardt, analytic Jacobian) and measures runtime.
 4. Returns a `CalibrationResult` frozen dataclass:
 
 ```python
 CalibrationResult(
     params=HestonParameters(v0, kappa, theta, sigma, rho),
-    loss=float,
+    loss=float,              # ½‖r(θ*)‖² at the optimum
     contract_count=int,
-    objective=str,
-    pricing_mode=str,
+    objective=str,           # always "price"
+    pricing_mode=str,        # "european_proxy" (the only supported mode)
     calibration_style=str,
     runtime_seconds=float,
+    weight_scheme=str,       # "vega" (default), "none", or "inv_spread"
 )
 ```
 
@@ -896,35 +921,31 @@ streamlit run app/Home.py
 
 ### Architecture
 
-Every page loads data through `load_app_data(page_key)` in [app/shared.py](app/shared.py), which is the single source of truth for:
-- Rendering sidebar controls
-- `@st.cache_data`-wrapped data loading, filtering, analytics building, and calibration
-- Calibration result storage (session state + JSON file)
-- Scope ID computation for cache keying
+The app is a **step-by-step, self-contained pipeline**. Each page under `app/pages/` loads its
+own data, runs its own step, and hands results to the next page via `st.session_state` (the raw
+chain and OIS curve are stashed by Step 1, the filtered chain by Step 2, the calibration by
+Step 3, and so on). `app/shared.py` is now minimal — just `configure_page()` and `sys.path`
+setup. The earlier centralized sidebar + `@st.cache_data` layer and the three-slot calibration
+panel were retired; that dead code lives in the gitignored `_graveyard.py`.
 
-### Caching Architecture
+### Page Flow
 
-| Cache function | Keyed by | What it caches |
-|----------------|----------|----------------|
-| `cached_load_chain` | `tickers_text` | Raw option chain from yfinance |
-| `cached_filter_chain` | `raw_df + all filter params` | Filtered chain + filter stats |
-| `cached_build_analytics` | `filtered_df + model params + r, q, limits` | Enriched analytics DataFrame |
-| `cached_calibrate_chain` | `filtered_df + r, q, grid sizes, expiry/contract counts, style` | `(calibration_meta, calibration_df)` |
+`Home` → `01_Fetch_Data` → `02_Filter_Options` → `03_Calibrate_Heston` → `04_Price_Contracts`
+→ `05_Volatility_Surface` → `06_Strategy_Lab` → `4_Risk_Dashboard` → `07_Mispricing_Screener`.
 
-Clicking **Refresh options chain** calls `clear_data_caches()` to invalidate all four caches and re-fetch live data.
+| Page | Step | Does |
+|------|------|------|
+| `Home.py` | — | Landing page; explains the pipeline and links the page flow |
+| `01_Fetch_Data.py` | 1 | Load a live chain + the SOFR/OIS curve; stash both in session state |
+| `02_Filter_Options.py` | 2 | Apply the 11-step filter and de-Americanize survivors (`euro_mid`, `deam_iv`) |
+| `03_Calibrate_Heston.py` | 3 | Select OTM near-ATM universe; vega-weighted LM over the CF pricer |
+| `04_Price_Contracts.py` | 4 | Price the chain under the calibrated params; build the analytics table |
+| `05_Volatility_Surface.py` | 5 | Market / model / error IV surfaces and Greek surfaces (Plotly 3-D) |
+| `06_Strategy_Lab.py` | 6 | Multi-leg strategy builder + payoff diagram + net Greeks |
+| `4_Risk_Dashboard.py` | 7 | Limit checks + 63-row spot×vol×time scenario table |
+| `07_Mispricing_Screener.py` | 8 | Model-vs-market dislocations, RV pairs, parity/bias/VRP lenses |
 
-### Model Modes
-
-The sidebar **Model mode** selector determines how model prices are computed:
-
-| Mode | Behavior |
-|------|----------|
-| `Use stored / calibrated Heston params` | Loads last calibration from session state or JSON cache; reprices with those params |
-| `Use existing/precomputed model prices` | Uses `calibrated_heston_price` column if present in raw data |
-| `Use manual Heston params` | User enters `v0,kappa,theta,sigma,rho` as text; reprices immediately |
-| `Market metrics only` | No model pricing; only market IV and Greeks computed |
-
-### Pages
+### Pages (detail)
 
 #### Home (`app/Home.py`)
 
@@ -979,28 +1000,18 @@ Requires calibrated model prices. Features:
 Builds a fully enriched analytics table:
 
 ```bash
-# Sample mode (uses nvda_vol.xlsx)
+# Market metrics only (live chain)
 python pipelines/run_pricing.py \
-  --source sample \
   --tickers NVDA \
   --max-contracts 100
 
 # With Heston model pricing (pass calibrated params)
 python pipelines/run_pricing.py \
-  --source sample \
   --tickers NVDA \
   --max-contracts 100 \
   --heston-params 0.04,2.0,0.04,0.5,-0.7 \
   --pricing-limit 50 \
   --output analytics.csv
-
-# Live data
-python pipelines/run_pricing.py \
-  --source live \
-  --tickers NVDA \
-  --spread-limit 0.05 \
-  --max-contracts 200 \
-  --output live_analytics.csv
 ```
 
 Without `--output`, prints a summary table showing: contract_id, type, maturity, strike, mid_price, market_iv, market_delta, market_gamma, market_vega, model_iv, iv_error.
@@ -1009,20 +1020,17 @@ Without `--output`, prints a summary table showing: contract_id, type, maturity,
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | `sample` | `sample` or `live` |
 | `--tickers` | `NVDA` | Comma-separated ticker list |
 | `--spread-limit` | `0.05` | Maximum relative bid-ask spread |
-| `--risk-free-rate` | `0.05` | Continuous risk-free rate |
+| `--risk-free-rate` | `0.05` | Continuous risk-free rate (fallback if no curve) |
 | `--dividend-yield` | `0.0` | Continuous dividend yield |
 | `--min-volume` | `1` | Minimum daily volume |
 | `--min-open-interest` | `0` | Minimum open interest |
 | `--max-maturity` | `2.0` | Maximum time to expiry in years |
 | `--max-contracts` | `400` | Hard contract cap |
+| `--option-types` | `call,put` | Option types to keep |
 | `--heston-params` | None | `v0,kappa,theta,sigma,rho` for model pricing |
 | `--pricing-limit` | `150` | Max contracts repriced with Heston model |
-| `--Ns` | `40` | PDE stock grid steps |
-| `--Nv` | `20` | PDE variance grid steps |
-| `--Nt` | `40` | PDE time steps |
 | `--output` | None | CSV output path |
 
 ### Calibration Pipeline — `pipelines/run_calibration.py`
@@ -1030,21 +1038,12 @@ Without `--output`, prints a summary table showing: contract_id, type, maturity,
 Calibrates Heston parameters and saves the result as JSON:
 
 ```bash
-# Fast calibration on sample data
+# Calibrate on a live chain (Levenberg-Marquardt, european-proxy)
 python pipelines/run_calibration.py \
-  --source sample \
   --tickers NVDA \
-  --calibration-style fast \
-  --output results.json
-
-# Full IV calibration on live data
-python pipelines/run_calibration.py \
-  --source live \
-  --tickers NVDA \
-  --calibration-style full \
   --max-expiries 6 \
   --contracts-per-expiry 6 \
-  --output calibration_full.json
+  --output results.json
 ```
 
 Output JSON structure:
@@ -1059,8 +1058,9 @@ Output JSON structure:
   "contract_count": 16,
   "objective": "price",
   "pricing_mode": "european_proxy",
-  "calibration_style": "fast",
+  "calibration_style": "european_proxy",
   "runtime_seconds": 4.21,
+  "weight_scheme": "vega",
   "calibration_contracts": ["NVDA_call_2024-01-19_500.0", "..."]
 }
 ```
@@ -1069,45 +1069,42 @@ Output JSON structure:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | `sample` | `sample` or `live` |
 | `--tickers` | `NVDA` | Comma-separated ticker list |
 | `--spread-limit` | `0.05` | Maximum relative bid-ask spread |
-| `--risk-free-rate` | `0.05` | Risk-free rate |
+| `--risk-free-rate` | `0.05` | Risk-free rate (fallback if no curve) |
 | `--dividend-yield` | `0.0` | Dividend yield |
-| `--calibration-style` | `fast` | `fast` or `full` |
+| `--min-volume` | `1` | Minimum daily volume |
+| `--min-open-interest` | `0` | Minimum open interest |
+| `--max-maturity` | `2.0` | Maximum time to expiry in years |
+| `--max-contracts` | `400` | Hard contract cap on the loaded chain |
 | `--max-expiries` | `6` | Max expiry dates in calibration universe |
 | `--contracts-per-expiry` | `6` | Contracts selected per expiry |
 | `--initial-guess` | None | Optional `v0,kappa,theta,sigma,rho` override |
-| `--Ns` | `40` | PDE stock grid steps |
-| `--Nv` | `20` | PDE variance grid steps |
-| `--Nt` | `40` | PDE time steps |
 | `--output` | None | JSON output path |
+
+Calibration always uses Levenberg-Marquardt over the European-proxy CF pricer with vega-weighted
+residuals; there is no `--calibration-style` flag.
 
 ---
 
 ## 17. Configuration
 
-### Global Constants — `config/market_config.py`
+### SOFR/OIS Discount Curve — `config/market_config.py`
+
+This module is no longer a bag of static constants — it builds the live discount curve:
 
 ```python
-RISK_FREE_RATE    = 0.05    # Default r used in pricing and Greeks
-DIVIDEND_YIELD    = 0.0     # Default q
+from config.market_config import get_ois_curve, interpolate_rate, fetch_sofr_rate
 
-MC_PATHS          = 10000   # Number of Monte Carlo paths (LSMC)
-MC_STEPS          = 100     # Number of time steps per path
-
-LSMC_BASIS_DEGREE = 2       # Polynomial degree for regression basis functions
+r_3m   = fetch_sofr_rate(T=0.25)          # single rate for most uses
+curve  = get_ois_curve()                  # full {T_years: rate} dict, cached ~1h
+r_at_T = interpolate_rate(curve, T=1.5)   # log-linear in discount factors
 ```
 
-### PDE Grid Size Trade-offs
-
-| Setting | Ns | Nv | Nt | Speed | Accuracy |
-|---------|----|----|----|----|---|
-| Fast | 20 | 10 | 20 | Very fast | Lower |
-| Default | 40 | 20 | 40 | Moderate | Good |
-| Accurate | 80 | 40 | 80 | Slow | High |
-
-The app exposes `Ns`, `Nv`, `Nt` as sidebar sliders for each page. CLI flags `--Ns`, `--Nv`, `--Nt` allow pipeline override.
+- **Short end (≤ 6M):** SOFR compound averages from FRED (`SOFR`, `SOFR30/90/180DAYAVG`).
+- **Long end (≥ 3M):** US Treasury on-the-run yields from yfinance (`^IRX`, `^FVX`, `^TNX`).
+- **Fallback:** flat `0.045` if every network call fails.
+- Cached for `_CACHE_TTL = 3600s`, so it is safe to call on every Streamlit rerender.
 
 ---
 
@@ -1118,50 +1115,35 @@ The app exposes `Ns`, `Nv`, `Nt` as sidebar sliders for each page. CLI flags `--
 ```
 1. Launch the app:
    streamlit run app/Home.py
+   Open the URL shown in the terminal (default: http://localhost:8501).
 
-2. Open the URL shown in the terminal (default: http://localhost:8501).
+2. Walk the page flow top to bottom — each page consumes the previous step's
+   result from session state, so run them in order:
 
-3. In the sidebar:
-   a. Enter tickers (e.g., "NVDA") and select data source.
-   b. Set risk-free rate and dividend yield.
-   c. Click "Refresh options chain" to load and normalize the chain.
-
-4. The Home page shows:
-   - Summary metrics (contract counts, expiry count, IV points).
-   - Filter breakdown: which filter dropped how many contracts.
-   - Two-tab explorer: Raw Contracts | Filtered Contracts.
-
-5. Click "Calibrate Heston" in the sidebar.
-   - Fast proxy calibration runs in seconds.
-   - Results are stored in results/calibrations/ and session state.
-   - Loss, contract count, and runtime are shown in a success banner.
-
-6. All pages now show model-calibrated values:
-   - Option Chain: model_iv, model Greeks, iv_error, mispricing_score.
-   - Volatility Surfaces: market/model/error surfaces in 3-D.
-   - Mispricing Screener: ranked single-leg trade ideas + relative value pairs.
-
-7. In Strategy Lab, select option legs from the filtered chain.
-   - Each leg: option type, strike, maturity, quantity, long/short.
-   - View the payoff diagram (P&L vs. spot at expiry).
-   - Break-even points and net Greeks are displayed.
-
-8. In Risk Dashboard, check the strategy against RiskLimits.
-   - Color-coded limit table (pass/warn/reject).
-   - 63-row scenario P&L table across spot x IV x time shocks.
+   Step 1  Fetch Data        Enter tickers; load the live chain + SOFR/OIS curve.
+   Step 2  Filter Options    Apply the 11-step filter; survivors are de-Americanized
+                             (euro_mid, deam_iv) automatically.
+   Step 3  Calibrate Heston  Vega-weighted Levenberg-Marquardt over the CF pricer;
+                             loss / contract count / runtime shown, result cached.
+   Step 4  Price Contracts   Reprice the chain under the calibrated params; build the
+                             enriched analytics table (model_iv, Greeks, iv_error).
+   Step 5  Volatility Surface  Market / model / error IV surfaces + Greek surfaces (3-D).
+   Step 6  Strategy Lab      Select legs; view payoff, break-evens, net Greeks.
+   Step 7  Risk Dashboard    Limit checks (pass/warn/reject) + 63-row scenario table.
+   Step 8  Mispricing Screener  Ranked dislocations + relative-value pairs.
 ```
 
 ### Using the CLI
 
 ```bash
-# Step 1: Calibrate on sample data
+# Step 1: Calibrate on a live chain
 python pipelines/run_calibration.py \
-  --source sample --calibration-style fast \
+  --tickers NVDA \
   --output calibration.json
 
 # Step 2: Read calibrated params and build enriched analytics
 python pipelines/run_pricing.py \
-  --source sample \
+  --tickers NVDA \
   --heston-params "$(python -c "
 import json
 d = json.load(open('calibration.json'))
@@ -1174,21 +1156,40 @@ print(f\"{d['v0']},{d['kappa']},{d['theta']},{d['sigma']},{d['rho']}\")
 
 ## 19. Key Design Decisions
 
-### Why L-BFGS-B?
+### Why Levenberg-Marquardt with an Analytic Jacobian?
 
-L-BFGS-B handles box constraints natively (essential for Heston parameter bounds), approximates the Hessian from gradients (avoids expensive second-derivative computations through Fourier integrals), and converges reliably from good starting points in the 5-dimensional parameter space. It is the standard choice for smooth, bounded, low-dimensional financial calibration problems.
+Heston calibration is a nonlinear least-squares problem, and LM (Gauss-Newton with damping) is
+its natural solver. The decisive advantage is the **Cui et al. (2016) analytic gradient**: it
+delivers an exact Jacobian for the cost of the pricing integrals themselves (one vectorized GL
+pass returns price + all five derivatives), so the optimizer never pays for finite differences
+and never suffers their noise. This replaced the earlier L-BFGS-B / scalar-IV-MSE setup, which
+was both slower (FD gradients) and less stable. `method='trf'` keeps the box constraints LM
+needs for Heston bounds.
 
-### Why Two Calibration Modes?
+### Why De-Americanize Instead of an American Pricer in the Loop?
 
-Full IV calibration with American PDE pricing is accurate but slow — each function evaluation prices dozens of contracts via a 2-D finite-difference grid. For real-time use in the web app, fast mode replaces American pricing with European Fourier inversion (valid for calls without dividends by no-early-exercise-premium arguments) and uses price MSE instead of IV MSE, cutting calibration time from minutes to seconds.
+Calibrating to raw American quotes would force a PDE/LSMC pricer inside every optimizer
+iteration — slow and numerically fragile. De-Americanizing once (CRR-tree implied vol → European
+re-price) strips the early-exercise premium in a model-consistent way, so the fast CF pricer and
+its analytic Jacobian can run the whole calibration. The only residual approximation is that the
+premium is computed under constant-vol GBM rather than Heston — a small, smooth correction.
 
-### Why Fourier Inversion for European Options?
+### Why a Characteristic-Function Engine for All Pricing?
 
-The characteristic function approach is exact up to numerical integration tolerance for European options — no grid discretization error, no Monte Carlo variance. `scipy.integrate.quad` is accurate and fast for smooth integrands, making it the default for any European or fast-proxy pricing.
+The CF approach is exact up to integration tolerance — no grid discretization error, no
+Monte Carlo variance — and the same Gauss-Legendre quadrature returns the analytic gradient
+used by calibration. Pricing and calibration therefore share one engine (same CF, same
+carry `q`), so model prices and the calibration objective are always mutually consistent.
 
-### Why PDE for American Options (Default)?
+### Why No American Pricer?
 
-LSMC requires thousands of paths and introduces Monte Carlo noise (results vary across runs). The explicit finite-difference PDE solver is fully deterministic, fast for the grid sizes used, and produces a clean interpolated result at `(S0, v0)`. LSMC is retained as an alternative for validation or for cases where Monte Carlo is preferred.
+The engine is European-equivalent by construction: de-Americanization (§7.0) maps American
+quotes to European-equivalent prices, and calibration fits that surface. Pricing American
+contracts as their European equivalent is then the consistent choice — a separate
+American pricer would reintroduce a second valuation basis. The previous PDE and LSMC
+pricers were already off the live path, so they were removed (archived in `_graveyard.py`).
+A dedicated American pricer can be reintroduced later if early-exercise P&L is needed
+explicitly.
 
 ### Why `ensure_option_frame()` as a Gate?
 

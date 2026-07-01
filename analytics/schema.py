@@ -1,3 +1,16 @@
+"""
+Canonical option-chain schema for the analytics pipeline.
+
+`ensure_option_frame()` is the single normalisation gate: it standardises column
+names, coerces numerics, and derives `T` (year fraction), `moneyness`,
+`mid_price`, and `rel_spread`. Every DataFrame must pass through it before being
+handed to analytics, calibration, or pricing, so all downstream code can assume a
+consistent schema.
+
+Upstream:   raw chains from data/market_data.py (via services/market_service.py).
+Downstream: analytics/chain_metrics.py, calibration/*, services/pricing_service.py.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable

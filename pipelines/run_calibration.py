@@ -1,3 +1,16 @@
+"""
+CLI: calibrate Heston parameters on a live option-chain snapshot.
+
+Fetches the chain from Yahoo Finance (services/market_service.load_live_chain),
+filters it (filter_chain_with_stats), and calibrates via the single
+characteristic-function method (de-Americanize + Levenberg-Marquardt). Prints or
+saves the fitted parameters as JSON.
+
+Example:
+    python pipelines/run_calibration.py --tickers NVDA --max-expiries 6 \\
+        --contracts-per-expiry 6 --output results.json
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.calibration_service import DEFAULT_INITIAL_GUESS, calibrate_option_chain
-from services.market_service import DEFAULT_SAMPLE_PATH, filter_option_chain, load_option_chain, parse_tickers
+from services.market_service import filter_chain_with_stats, load_live_chain, parse_tickers
 from services.pricing_service import HestonParameters
 
 
@@ -24,9 +37,7 @@ def _parse_initial_guess(raw_guess: str | None) -> HestonParameters:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Calibrate Heston parameters on an option-chain snapshot.")
-    parser.add_argument("--source", choices=("sample", "live"), default="sample")
-    parser.add_argument("--sample-path", default=str(DEFAULT_SAMPLE_PATH))
+    parser = argparse.ArgumentParser(description="Calibrate Heston parameters on a live option-chain snapshot.")
     parser.add_argument("--tickers", default="NVDA")
     parser.add_argument("--spread-limit", type=float, default=0.05)
     parser.add_argument("--risk-free-rate", type=float, default=0.05)
@@ -37,11 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-contracts", type=int, default=400)
     parser.add_argument("--max-expiries", type=int, default=6)
     parser.add_argument("--contracts-per-expiry", type=int, default=6)
-    parser.add_argument("--calibration-style", choices=("fast", "full"), default="fast")
     parser.add_argument("--initial-guess", help="Optional v0,kappa,theta,sigma,rho tuple.")
-    parser.add_argument("--Ns", type=int, default=40)
-    parser.add_argument("--Nv", type=int, default=20)
-    parser.add_argument("--Nt", type=int, default=40)
     parser.add_argument("--output", help="Optional JSON output path.")
     return parser
 
@@ -49,18 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    tickers = parse_tickers(args.tickers)
 
-    raw_df = load_option_chain(
-        source=args.source,
-        sample_path=args.sample_path,
-        tickers=parse_tickers(args.tickers),
+    raw_df = load_live_chain(tickers)
+    filtered_df, _stats = filter_chain_with_stats(
+        raw_df,
         spread_limit=args.spread_limit,
         r=args.risk_free_rate,
         q=args.dividend_yield,
-    )
-    filtered_df = filter_option_chain(
-        raw_df,
-        tickers=parse_tickers(args.tickers),
+        tickers=tickers,
         min_volume=args.min_volume,
         min_open_interest=args.min_open_interest,
         max_maturity=args.max_maturity,
@@ -72,16 +76,14 @@ def main() -> int:
         r=args.risk_free_rate,
         q=args.dividend_yield,
         initial_guess=_parse_initial_guess(args.initial_guess),
-        Ns=args.Ns,
-        Nv=args.Nv,
-        Nt=args.Nt,
         max_expiries=args.max_expiries,
         contracts_per_expiry=args.contracts_per_expiry,
-        calibration_style=args.calibration_style,
+        american_method="european_proxy",
     )
 
     payload = calibration_result.as_dict()
-    payload["calibration_contracts"] = calibration_df["contract_id"].tolist()
+    if "contract_id" in calibration_df.columns:
+        payload["calibration_contracts"] = calibration_df["contract_id"].tolist()
 
     if args.output:
         Path(args.output).write_text(json.dumps(payload, indent=2))
