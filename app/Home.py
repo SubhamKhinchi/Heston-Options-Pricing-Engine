@@ -59,10 +59,13 @@ def _render_cal_params(meta: dict) -> None:
         ],
     })
     st.dataframe(params_df, hide_index=True, use_container_width=True)
+    _iv = meta.get("iv_rmse")
+    _fit = (f"IV-RMSE: {_iv * 100:.2f} vol pts" if pd.notna(_iv)
+            else f"Loss: {meta['loss']:.3e}")
     st.markdown(
         f"Feller: :{color}[{feller:+.4f} "
         f"({'✓' if feller > 0 else '✗'})]  "
-        f"| Loss: {meta['loss']:.3e}"
+        f"| {_fit}"
     )
 
 
@@ -210,7 +213,11 @@ else:
             st.dataframe(full_df, use_container_width=True, hide_index=True)
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Loss", f"{meta['loss']:.4e}")
+            _iv = meta.get("iv_rmse")
+            if pd.notna(_iv):
+                m1.metric("IV-RMSE", f"{_iv * 100:.2f} vpts")
+            else:
+                m1.metric("Loss", f"{meta['loss']:.4e}")
             m2.metric("Contracts used", int(meta["contract_count"]))
             m3.metric("Runtime", f"{meta['runtime_seconds']:.1f}s")
 
@@ -243,7 +250,9 @@ else:
                         "σ": round(m["sigma"], 4),
                         "ρ": round(m["rho"], 4),
                         "Feller": round(f, 4),
-                        "Loss": f"{m['loss']:.4e}",
+                        "IV-RMSE (vpts)": (f"{m['iv_rmse']*100:.2f}"
+                                           if pd.notna(m.get("iv_rmse"))
+                                           else f"loss {m['loss']:.2e}"),
                         "Runtime (s)": round(m["runtime_seconds"], 1),
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)

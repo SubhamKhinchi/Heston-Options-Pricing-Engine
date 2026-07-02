@@ -253,8 +253,20 @@ def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
         f"**Feller** 2κθ−σ²: :{color}[{feller:+.4f}  "
         f"({'satisfied ✓' if feller > 0 else 'violated ✗'})]"
     )
+    # Headline fit quality is IV-space (vol points) — interpretable and comparable
+    # across tickers. The raw vega-weighted price loss scales with notional
+    # (~1e5-1e6 for an index even for an excellent fit), so it is not shown here.
+    iv_rmse = meta.get("iv_rmse")
+    iv_mae = meta.get("iv_mae")
+    if pd.notna(iv_rmse):
+        quality = (
+            f"IV-RMSE: {iv_rmse * 100:.2f} vol pts  |  "
+            f"IV-MAE: {iv_mae * 100:.2f} vol pts"
+        )
+    else:  # back-compat for results cached before IV metrics existed
+        quality = f"Loss: {meta['loss']:.4e}"
     st.caption(
-        f"Loss: {meta['loss']:.4e}  |  "
+        f"{quality}  |  "
         f"Contracts used: {int(meta['contract_count'])}  |  "
         f"Runtime: {meta['runtime_seconds']:.1f}s"
     )

@@ -29,6 +29,7 @@ import pandas as pd
 from analytics.schema import ensure_option_frame
 from calibration.calibrate_heston import calibrate_heston
 from calibration.de_americanize import add_deamericanized_columns
+from calibration.heston_loss_function import iv_error_metrics
 from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters
 
@@ -61,6 +62,12 @@ class CalibrationResult:
     calibration_style: str
     runtime_seconds: float
     weight_scheme: str = "vega"
+    # IV-space fit quality (fractions; ×100 for vol points). These are the
+    # interpretable, cross-ticker-comparable headline numbers — the raw `loss`
+    # is a vega-weighted price SSE that scales with notional and is kept only
+    # for internal/back-compat use. See heston_loss_function.iv_error_metrics.
+    iv_rmse: float = float("nan")
+    iv_mae: float = float("nan")
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -70,6 +77,8 @@ class CalibrationResult:
             "sigma": self.params.sigma,
             "rho": self.params.rho,
             "loss": self.loss,
+            "iv_rmse": self.iv_rmse,
+            "iv_mae": self.iv_mae,
             "contract_count": self.contract_count,
             "objective": self.objective,
             "pricing_mode": self.pricing_mode,
@@ -330,6 +339,10 @@ def calibrate_option_chain(
     )
     runtime_seconds = perf_counter() - start_time
 
+    # Interpretable IV-space fit quality (vol points), independent of the raw
+    # notional-scaled price loss. Reporting only — does not affect the fit.
+    iv_rmse, iv_mae = iv_error_metrics(params_opt, r, q, calibration_df)
+
     result = CalibrationResult(
         params=HestonParameters.from_iterable(params_opt),
         loss=float(loss_val),
@@ -339,5 +352,7 @@ def calibrate_option_chain(
         calibration_style=american_method,
         runtime_seconds=float(runtime_seconds),
         weight_scheme=weight_scheme,
+        iv_rmse=float(iv_rmse),
+        iv_mae=float(iv_mae),
     )
     return result, calibration_df

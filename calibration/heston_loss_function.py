@@ -123,6 +123,50 @@ def _model_price_and_grad(row, params, r, q, Ns, Nv, Nt, pricing_mode):
 
 
 # ------------------------------------------------------------------ #
+# Reporting metric: IV-space fit quality (does NOT affect calibration)
+# ------------------------------------------------------------------ #
+
+def iv_error_metrics(params, r, q, options_df, *, vega_floor=0.05):
+    """
+    Vega-linearised implied-vol fit error at ``params``, in IV (fraction) units.
+
+    The raw calibration loss is a vega-weighted *price* sum-of-squares whose
+    absolute value scales with the underlying's price level and contract count
+    (so it reads ~1e5-1e6 for an index like ^SPX even for an excellent fit, and
+    is not comparable across tickers). This converts each price residual to an
+    approximate IV error via the first-order relationship the vega weighting
+    already exploits,
+
+        ΔIV_i ≈ (P_model,i − P_market,i) / vega_i        (BS vega at the market IV)
+
+    and returns (iv_rmse, iv_mae) as fractions — multiply by 100 for vol points.
+    These are dimensionless and directly interpretable ("we fit the surface to
+    X vol points"), and comparable across underlyings.
+
+    Reporting only: it re-prices at the fitted params and is independent of the
+    optimiser's ``weight_scheme``, so it always reflects true IV-space quality.
+    Vega is floored (as in the weights) to avoid blow-up on near-zero-vega wings.
+    """
+    errs = []
+    for row in options_df.itertuples(index=False):
+        market = row.mid_price
+        if market <= 0:
+            continue
+        rr = float(getattr(row, "r", r))
+        qq = float(getattr(row, "q", q))
+        price, _ = _model_price_and_grad(row, params, rr, qq, 0, 0, 0, "european_proxy")
+        iv = float(getattr(row, "market_iv", np.nan))
+        if not np.isfinite(iv) or iv <= 0:
+            iv = 0.3  # same fallback the vega weights use when market IV is missing
+        v = bs_vega(row.spot, row.strike, rr, row.T, iv, qq)
+        errs.append((price - market) / max(v, vega_floor))
+    if not errs:
+        return float("nan"), float("nan")
+    e = np.asarray(errs)
+    return float(np.sqrt(np.mean(e ** 2))), float(np.mean(np.abs(e)))
+
+
+# ------------------------------------------------------------------ #
 # Public API consumed by calibrate_heston.py
 # ------------------------------------------------------------------ #
 
