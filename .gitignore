@@ -29,7 +29,7 @@ CLAUDE.md
 *.json
 *.xlsx
 $.pdf
-.ipynb
+*.ipynb
 
 # Archived pages (old UI — kept for local reference, not tracked in git)
 app/pages/_archived_pages/
