@@ -1,24 +1,178 @@
 """
 Data-driven initial guess and parameter bounds for Heston model calibration.
 
-Uses the shape of the market implied-volatility surface to estimate
-sensible starting values and tight search bounds for (v0, kappa, theta, sigma, rho).
+Two generations of tooling live here:
 
-Algorithm overview
-------------------
-1. v0    — ATM IV² at the shortest liquid maturity
-2. theta — ATM IV² at the longest liquid maturity
-3. sigma — vol-of-vol from quadratic smile curvature: σ ≈ sqrt(8 * c)
-4. rho   — correlation from ATM smile slope: ρ ≈ 2 * b / sigma
-5. kappa — mean reversion from term-structure slope of ATM variance
+**Active (used by calibration_service by default):**
+- ``estimate_kappa0_from_chain`` — κ₀ from the chain's ATM average-variance term
+  structure. κ is weakly identified by the full surface (the κ–σ degeneracy valley
+  lets the optimizer drift to a bound), so the service *fixes* κ = κ₀ and
+  calibrates only (v0, θ, σ, ρ). Q-measure, no historical data.
+- ``dynamic_v0_theta_bounds`` — wide guard-rail boxes for v0/θ scaled to the
+  chain's observed deam_iv range. The variance-level parameters are the only
+  truly ticker-sensitive bounds (a fixed 0.05 variance floor = 22.4% vol sits
+  above the entire SPX surface); reading the scale from the data keeps the box
+  from ever binding, in the spirit of Cui et al.'s unconstrained calibration.
+
+**Legacy (kept as sanity/starting-point tools, not on the default path):**
+``compute_data_driven_bounds`` — full 5-parameter smile-shape estimator (ATM IVs,
+skew slope, curvature). Produces *tight* per-chain boxes, which steer the fit;
+see project history for why tight boxing was retired.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import least_squares
 
 from calibration.implied_vol import implied_volatility
+
+
+# ── κ₀ from the ATM term structure (active path) ─────────────────────────────
+
+def estimate_kappa0_from_chain(
+    chain: pd.DataFrame,
+    *,
+    atm_band: float = 0.10,
+    fallback: float = 2.0,
+    kappa_fit_bounds: tuple[float, float] = (0.05, 20.0),
+) -> dict:
+    """
+    Estimate the Heston mean-reversion speed κ₀ from the option chain itself.
+
+    Under Heston, the ATM total implied variance is (to leading order) the
+    integrated expected variance, so the *average* variance term structure is
+
+        w(T)/T ≈ θ + (v0 − θ) · (1 − e^{−κT}) / (κT)
+
+    a 3-parameter curve where v0 is the short-end limit, θ the long-end limit
+    and κ the bend speed between them. One ATM variance per expiry (OTM call +
+    OTM put nearest the forward, ``deam_iv`` averaged — cancels parity noise),
+    fit in average-variance space so every expiry carries equal weight.
+
+    This is a Q-measure estimate — no historical data, no P→Q risk-premium
+    assumption — and it is the anchor used to FIX κ in calibration (κ is not
+    identified by the full surface; see module docstring).
+
+    Trust checks (`trusted=False` falls back to ``fallback``): enough expiries
+    and term-structure length, a genuinely sloped term structure (flat ⇒ the
+    (v0−θ) factor kills the κ term and no method can recover κ), κ resolved
+    relative to its standard error, and κ not parked at the pre-fit's own box.
+
+    Requires columns: T, strike, forward, type, deam_iv, atm_distance
+    (all present on any chain out of market_service.filter_chain_with_stats).
+
+    Returns dict with: kappa0, kappa0_raw, trusted, v0_ts, theta_ts, se_kappa,
+    n_expiries, half_life_months, ts_points (list of (T, atm_variance)).
+    """
+    needed = {"T", "strike", "forward", "type", "deam_iv", "atm_distance"}
+    if chain is None or chain.empty or not needed.issubset(chain.columns):
+        return {"kappa0": fallback, "kappa0_raw": float("nan"), "trusted": False,
+                "v0_ts": float("nan"), "theta_ts": float("nan"),
+                "se_kappa": float("nan"), "n_expiries": 0,
+                "half_life_months": float(np.log(2.0) / fallback * 12),
+                "ts_points": [],
+                "warning": "chain missing deam_iv/forward columns — fallback κ₀ used"}
+
+    pts = []
+    for T, g in chain.groupby("T"):
+        ivs = []
+        for side in (
+            g[(g["type"] == "call") & (g["strike"] >= g["forward"])],
+            g[(g["type"] == "put") & (g["strike"] <= g["forward"])],
+        ):
+            side = side[(side["atm_distance"] < atm_band) & (side["deam_iv"] > 0)]
+            if len(side):
+                ivs.append(float(side.loc[side["atm_distance"].idxmin(), "deam_iv"]))
+        if ivs:
+            pts.append((float(T), float(np.mean(ivs)) ** 2))
+
+    out = {"kappa0": fallback, "kappa0_raw": float("nan"), "trusted": False,
+           "v0_ts": float("nan"), "theta_ts": float("nan"), "se_kappa": float("nan"),
+           "n_expiries": len(pts), "ts_points": pts,
+           "half_life_months": float(np.log(2.0) / fallback * 12)}
+    if len(pts) < 4:
+        out["warning"] = f"only {len(pts)} usable expiries — fallback κ₀ used"
+        return out
+
+    Ts = np.array([p[0] for p in pts])
+    y = np.array([p[1] for p in pts])
+
+    def avg_var(p):
+        v0, th, k = p
+        return th + (v0 - th) * (1.0 - np.exp(-k * Ts)) / (k * Ts)
+
+    p0 = [y[np.argmin(Ts)], y[np.argmax(Ts)], 2.0]
+    lo_k, hi_k = kappa_fit_bounds
+    res = least_squares(lambda p: avg_var(p) - y, p0,
+                        bounds=([1e-4, 1e-4, lo_k], [4.0, 4.0, hi_k]))
+    v0_ts, theta_ts, k = (float(x) for x in res.x)
+
+    # se(κ) from the fit covariance: legit here (one independent point per expiry,
+    # unlike the overlapping-window AR(1) estimator this design replaced).
+    dof = max(len(Ts) - 3, 1)
+    s2 = 2.0 * res.cost / dof
+    try:
+        cov = s2 * np.linalg.pinv(res.jac.T @ res.jac)
+        se_k = float(np.sqrt(max(cov[2, 2], 0.0)))
+    except Exception:
+        se_k = float("nan")
+
+    # Trust checks. The se gate is the primary flatness detector: a flat term
+    # structure makes κ unidentifiable and the fit covariance explodes (se ≫ κ),
+    # so a strict relative-se test catches it directly. The slope gate is kept
+    # only as a mild backstop — a hard slope threshold double-counts the se
+    # information and flips marginal chains (e.g. NVDA at ~0.25 relative slope)
+    # between trusted and fallback on day-to-day quote noise.
+    trusted = bool(
+        len(Ts) >= 5
+        and Ts.max() >= 0.4                              # enough term structure to bend
+        and abs(v0_ts - theta_ts) > 0.10 * max(v0_ts, theta_ts)   # TS not literally flat
+        and np.isfinite(se_k) and se_k < 0.6 * k         # κ resolved vs its own error
+        and lo_k * 1.5 < k < hi_k / 1.5                  # not parked at the pre-fit box
+    )
+    kappa0 = k if trusted else fallback
+    out.update({
+        "kappa0": float(kappa0), "kappa0_raw": k, "trusted": trusted,
+        "v0_ts": v0_ts, "theta_ts": theta_ts, "se_kappa": se_k,
+        "half_life_months": float(np.log(2.0) / kappa0 * 12),
+    })
+    if not trusted:
+        out["warning"] = "ATM term structure uninformative about κ — fallback κ₀ used"
+    return out
+
+
+# ── Dynamic v0/θ guard rails from the observed IV range (active path) ────────
+
+def dynamic_v0_theta_bounds(
+    chain: pd.DataFrame,
+    *,
+    lo_mult: float = 0.25,
+    hi_mult: float = 4.0,
+    var_floor: float = 1e-4,
+    var_cap: float = 4.0,
+) -> tuple[float, float]:
+    """
+    Wide (lo, hi) variance box for v0 and θ from the chain's deam_iv range:
+
+        [lo_mult · q01(deam_iv)²,  hi_mult · q99(deam_iv)²]
+
+    1%/99% quantiles so a single junk quote cannot distort the box; ×4 margins
+    so the box is a guard rail, never a steering constraint (a fitted v0/θ at
+    one of these edges indicates a data problem, not a tight market). Falls
+    back to (var_floor, var_cap) — effectively unbounded — without deam_iv.
+    """
+    if chain is None or chain.empty or "deam_iv" not in chain.columns:
+        return (var_floor, var_cap)
+    iv = chain["deam_iv"].dropna()
+    iv = iv[iv > 0]
+    if len(iv) < 5:
+        return (var_floor, var_cap)
+    lo_iv, hi_iv = float(iv.quantile(0.01)), float(iv.quantile(0.99))
+    lo = float(np.clip(lo_mult * lo_iv ** 2, var_floor, var_cap))
+    hi = float(np.clip(hi_mult * hi_iv ** 2, lo + 1e-6, var_cap))
+    return (lo, hi)
 
 
 # ── IV helper ─────────────────────────────────────────────────────────────────

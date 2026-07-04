@@ -1,10 +1,13 @@
 """
 Step 3 — Calibrate Heston.
 
-Fits the five Heston parameters to the filtered chain via the single
-characteristic-function method (services/calibration_service.calibrate_option_chain):
-select the OTM, near-ATM calibration universe, then vega-weighted Levenberg-Marquardt
-over the fast CF pricer. Quotes are already de-Americanized upstream (Step 2 Filter).
+Fits (v0, theta, sigma, rho) to the filtered chain — kappa is FIXED to the chain's
+own ATM term-structure estimate (the surface does not identify kappa; see
+calibration/data_driven_bounds.estimate_kappa0_from_chain) — via
+services/calibration_service.calibrate_option_chain: select the OTM, near-ATM
+calibration universe, then vega-weighted Levenberg-Marquardt over the fast CF
+pricer. v0/theta search bounds are dynamic guard rails scaled to the chain's
+observed deam_iv range. Quotes are already de-Americanized upstream (Step 2 Filter).
 Stashes the result for downstream pricing. Upstream: Step 2.
 Downstream: Step 4 (Price Contracts) and the surface/screener pages.
 """
@@ -20,9 +23,14 @@ for path in (PROJECT_ROOT, APP_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
+from calibration.data_driven_bounds import (
+    dynamic_v0_theta_bounds,
+    estimate_kappa0_from_chain,
+)
 from services.calibration_service import (
     calibrate_option_chain,
     DEFAULT_BOUNDS,
@@ -34,9 +42,9 @@ from services.pricing_service import HestonParameters
 st.set_page_config(page_title="Calibrate Heston", layout="wide")
 st.title("Step 3 — Calibrate Heston Model")
 st.caption(
-    "Fit the five Heston parameters (v₀, κ, θ̄, σ, ρ) to the de-Americanized option "
-    "chain using the Levenberg-Marquardt optimiser with the analytic Cui et al. (2016) "
-    "Jacobian. Set the initial guess and search bounds below."
+    "Fit four Heston parameters (v₀, θ̄, σ, ρ) to the de-Americanized option chain "
+    "using the Levenberg-Marquardt optimiser with the analytic Cui et al. (2016) "
+    "Jacobian. κ is **fixed** from the chain's own ATM term structure — see below."
 )
 
 ss = st.session_state
@@ -135,35 +143,12 @@ cpe = int(contracts_per_expiry) if contracts_per_expiry > 0 else None
 min_maturity = float(min_mat_days) / 365.0
 max_maturity = float(max_mat_years) if max_mat_years > 0 else None
 
-# Parameter metadata and the global feasible box (mirrors calibrate_heston._DEFAULT_BOUNDS).
-_PARAM_META = [
-    ("v₀", "init variance"),
-    ("κ",  "mean-reversion speed"),
-    ("θ̄",  "long-run variance"),
-    ("σ",  "vol of vol"),
-    ("ρ",  "spot-vol correlation"),
-]
-_GLOBAL_LB = [1e-4, 1e-4, 1e-4, 1e-4, -0.999]
-_GLOBAL_UB = [2.0, 10.0, 2.0, 5.0, 0.999]
-
-
-def _params_from_editor(edited_df: pd.DataFrame) -> tuple[HestonParameters, list[tuple[float, float]]]:
-    """Read the shared editable table into an initial guess + bounds list.
-
-    Clamps each row to the global feasible box and enforces lower ≤ guess ≤ upper.
-    """
-    guess_vals: list[float] = []
-    bounds_list: list[tuple[float, float]] = []
-    for i in range(5):
-        g = float(edited_df["Initial guess"].iloc[i])
-        lo = max(float(edited_df["Lower bound"].iloc[i]), _GLOBAL_LB[i])
-        hi = min(float(edited_df["Upper bound"].iloc[i]), _GLOBAL_UB[i])
-        if lo > hi:
-            lo, hi = hi, lo
-        g = min(max(g, lo), hi)
-        guess_vals.append(g)
-        bounds_list.append((lo, hi))
-    return HestonParameters.from_iterable(guess_vals), bounds_list
+# ── κ fixed from the chain + dynamic v0/θ guard rails ────────────────────────
+# Same estimators the calibration service uses internally, run here so the page
+# can PREVIEW the κ₀ and the default box the fit will actually use.
+_kappa_info = estimate_kappa0_from_chain(filtered_df)
+_var_lo, _var_hi = dynamic_v0_theta_bounds(filtered_df)
+_k0 = float(_kappa_info["kappa0"])
 
 
 def _run_calibration(
@@ -191,45 +176,111 @@ def _run_calibration(
     )
 
 
-# ── Initial parameters & search bounds (user-set; seeded from Cui et al. 2016) ──
+# ── κ — fixed from the option chain ──────────────────────────────────────────
+st.divider()
+st.subheader("κ — fixed from the option chain")
+_kc1, _kc2, _kc3 = st.columns(3)
+_kc1.metric("κ₀ (mean-reversion speed)", f"{_k0:.2f}")
+_kc2.metric("Variance half-life", f"{_kappa_info['half_life_months']:.1f} mo")
+_kc3.metric(
+    "Source",
+    "ATM term structure" if _kappa_info["trusted"] else "fallback (κ₀ = 2.0)",
+)
+st.caption(
+    "κ is **not optimised** — the option surface doesn't identify it (κ and σ trade "
+    "off along a near-flat valley, so a free κ just drifts to a bound). Instead, κ₀ "
+    "is read off this chain's ATM variance term structure: one ATM implied variance "
+    "per expiry, fit to the Heston curve  w(T)/T = θ̄ + (v₀−θ̄)(1−e^{−κT})/(κT), "
+    "where κ is the speed at which short-dated variance bends to the long-run level. "
+    "Risk-neutral by construction — no historical data involved."
+)
+if not _kappa_info["trusted"]:
+    st.warning(
+        "This chain's ATM term structure is too flat or too short to pin κ "
+        "(no method can recover κ from a flat term structure) — using the "
+        "conventional fallback κ₀ = 2.0."
+    )
+
+# ── Initial parameters & search bounds (v₀, θ̄, σ, ρ) ─────────────────────────
 st.divider()
 st.subheader("Initial parameters & search bounds")
+_iv_series = filtered_df["deam_iv"].dropna() if "deam_iv" in filtered_df.columns else pd.Series(dtype=float)
+_iv_series = _iv_series[_iv_series > 0]
+_iv_note = (
+    f"observed IV range {_iv_series.quantile(0.01):.0%}–{_iv_series.quantile(0.99):.0%} "
+    f"→ variance box [{_var_lo:.4f}, {_var_hi:.3f}]"
+    if len(_iv_series) else "no de-Americanized IVs found — wide static box"
+)
 st.caption(
-    "Defaults are the fixed ranges from **Cui et al. (2016), Table 5** — the paper "
-    "calibrates *without presuming parameter values*. **Edit any cell** before "
-    "calibrating; the search box is entirely user-controlled. "
-    "Note: Table 5's σ ceiling (0.95) suits the paper's validation set — for "
-    "high vol-of-vol single names (e.g. NVDA) raise the σ upper bound."
+    f"v₀/θ̄ default bounds are **dynamic guard rails** scaled to this chain's "
+    f"de-Americanized IV level ({_iv_note}); σ/ρ defaults are fixed wide ranges. "
+    "In the spirit of Cui et al. (2016), bounds exist to keep the optimiser in "
+    "sane territory, **never to steer the fit** — a fitted parameter sitting at a "
+    "bound signals a data problem, not a market view. All fields are editable."
 )
 
-_ig = DEFAULT_INITIAL_GUESS.as_tuple()
-_bnds = DEFAULT_BOUNDS
+# Seed guesses: v₀/θ̄ from the term-structure pre-fit when available (same surface,
+# closer start), else the stock defaults clamped into the box.
+_g = DEFAULT_INITIAL_GUESS
+_v0_seed = _kappa_info.get("v0_ts", float("nan"))
+_th_seed = _kappa_info.get("theta_ts", float("nan"))
+_v0_seed = float(_v0_seed) if np.isfinite(_v0_seed) and _v0_seed > 0 else _g.v0
+_th_seed = float(_th_seed) if np.isfinite(_th_seed) and _th_seed > 0 else _g.theta
 
-_editor_seed = pd.DataFrame({
-    "Parameter":     [m[0] for m in _PARAM_META],
-    "Initial guess": [round(float(_ig[i]), 4) for i in range(5)],
-    "Lower bound":   [round(float(_bnds[i][0]), 4) for i in range(5)],
-    "Upper bound":   [round(float(_bnds[i][1]), 4) for i in range(5)],
-    "Meaning":       [m[1] for m in _PARAM_META],
-})
-edited_params = st.data_editor(
-    _editor_seed,
-    key="param_editor",
-    hide_index=True,
-    use_container_width=True,
-    disabled=["Parameter", "Meaning"],
-    column_config={
-        "Initial guess": st.column_config.NumberColumn(format="%.4f", step=0.01),
-        "Lower bound":   st.column_config.NumberColumn(format="%.4f", step=0.01),
-        "Upper bound":   st.column_config.NumberColumn(format="%.4f", step=0.01),
-    },
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return float(min(max(x, lo), hi))
+
+_param_spec = [
+    # key, label, meaning, (guess, lo, hi), widget min/max/step/format
+    ("v0",    "v₀ — init variance",      (_clamp(_v0_seed, _var_lo, _var_hi), _var_lo, _var_hi),
+     dict(min_value=0.0001, max_value=4.0, step=0.005, format="%.4f")),
+    ("theta", "θ̄ — long-run variance",   (_clamp(_th_seed, _var_lo, _var_hi), _var_lo, _var_hi),
+     dict(min_value=0.0001, max_value=4.0, step=0.005, format="%.4f")),
+    ("sigma", "σ — vol of vol",          (_clamp(_g.sigma, *DEFAULT_BOUNDS[3]), *DEFAULT_BOUNDS[3]),
+     dict(min_value=0.01, max_value=5.0, step=0.05, format="%.2f")),
+    ("rho",   "ρ — spot-vol correlation", (_clamp(_g.rho, *DEFAULT_BOUNDS[4]), *DEFAULT_BOUNDS[4]),
+     dict(min_value=-0.999, max_value=0.0, step=0.05, format="%.3f")),
+]
+
+_vals: dict[str, tuple[float, float, float]] = {}
+for _col, (key, label, (g0, lo0, hi0), kw) in zip(st.columns(4), _param_spec):
+    with _col:
+        st.markdown(f"**{label}**")
+        g = st.number_input("Initial guess", value=float(round(g0, 4)), key=f"{key}_guess", **kw)
+        lo = st.number_input("Lower bound", value=float(round(lo0, 4)), key=f"{key}_lo", **kw)
+        hi = st.number_input("Upper bound", value=float(round(hi0, 4)), key=f"{key}_hi", **kw)
+        if lo > hi:
+            lo, hi = hi, lo
+        _vals[key] = (_clamp(g, lo, hi), lo, hi)
+
+shared_guess = HestonParameters(
+    v0=_vals["v0"][0], kappa=_k0, theta=_vals["theta"][0],
+    sigma=_vals["sigma"][0], rho=_vals["rho"][0],
 )
-shared_guess, shared_bounds = _params_from_editor(edited_params)
+# κ slot is a placeholder — calibrate_option_chain pinches it to κ₀ (fix_kappa=True).
+shared_bounds = [
+    (_vals["v0"][1], _vals["v0"][2]),
+    DEFAULT_BOUNDS[1],
+    (_vals["theta"][1], _vals["theta"][2]),
+    (_vals["sigma"][1], _vals["sigma"][2]),
+    (_vals["rho"][1], _vals["rho"][2]),
+]
 
 def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
     """Render calibration result inside a column."""
     feller = 2 * meta["kappa"] * meta["theta"] - meta["sigma"] ** 2
     color = "green" if feller > 0 else "red"
+
+    if meta.get("kappa_fixed"):
+        half_life = meta.get("kappa_half_life_months", float("nan"))
+        hl_txt = f", half-life {half_life:.1f} mo" if pd.notna(half_life) else ""
+        kappa_note = (
+            f"fixed — κ₀ from ATM term structure{hl_txt}"
+            if meta.get("kappa_source") == "chain_term_structure"
+            else f"fixed — fallback κ₀ (flat term structure){hl_txt}"
+        )
+    else:
+        kappa_note = "mean-reversion speed (optimised)"
 
     res_df = pd.DataFrame({
         "Param": ["v₀", "κ", "θ̄", "σ", "ρ"],
@@ -242,7 +293,7 @@ def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
         ],
         "Implied": [
             f"init vol {meta['v0']**0.5*100:.2f}%",
-            "mean-reversion speed",
+            kappa_note,
             f"long-run vol {meta['theta']**0.5*100:.2f}%",
             "vol of vol",
             "spot-vol correlation",
@@ -297,9 +348,10 @@ with col_main:
     st.caption(
         "Quotes are de-Americanized to European-equivalent prices upstream (in the "
         "**Filter** step, via a Black-Scholes binomial tree that strips the early-exercise "
-        "premium), so the fit targets the European-equivalent surface directly. The five "
-        "Heston parameters are then fit with the fast characteristic-function pricer and "
-        "the Levenberg-Marquardt optimiser (Cui et al. 2016), vega-weighted — no American "
+        "premium), so the fit targets the European-equivalent surface directly. The four "
+        "free parameters (v₀, θ̄, σ, ρ) are then fit — with κ held at the chain-implied "
+        "κ₀ above — using the fast characteristic-function pricer and the "
+        "Levenberg-Marquardt optimiser (Cui et al. 2016), vega-weighted — no American "
         "pricer in the loop."
     )
 
