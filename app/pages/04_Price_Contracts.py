@@ -27,7 +27,7 @@ from services.market_service import parse_tickers
 from services.pricing_service import HestonParameters
 
 st.set_page_config(page_title="Price Contracts", layout="wide")
-st.title("Step 4 — Price Contracts")
+st.title("Price Contracts")
 st.caption(
     "Apply calibrated Heston parameters to price every filtered contract under the "
     "European Heston model. Adds model price, de-Americanized market IV, model IV, "
@@ -53,8 +53,8 @@ def _completed_methods(cal: dict) -> dict[str, str]:
 
 # ── Prerequisite checks ───────────────────────────────────────────────────────
 if "raw_df" not in ss:
-    st.warning("No data loaded. Go to **Fetch Data** first.")
-    st.page_link("pages/01_Fetch_Data.py", label="← Go to Fetch Data", icon="📥")
+    st.warning("No data loaded. Go to **Load Market Data** first.")
+    st.page_link("pages/01_Load_Market_Data.py", label="← Go to Load Market Data", icon="📥")
     st.stop()
 
 if "filtered_df" not in ss or ss["filtered_df"].empty:
@@ -80,7 +80,7 @@ q = params.get("q", 0.0)
 if not rate_curve:
     st.warning(
         f"⚠️ SOFR/OIS rates unavailable — using {r*100:.2f}% flat rate. "
-        "Go to Fetch Data and refresh rates to reload the curve."
+        "Go to Load Market Data and refresh rates to reload the curve."
     )
 
 # Per-ticker caption
@@ -138,15 +138,16 @@ with col_right:
         "with the de-Americanized calibration and vol surface. American pricing "
         "(PDE / LSMC) is not used here."
     )
+    n_chain = len(filtered_df)
     pricing_limit = st.number_input(
-        "Pricing limit (max contracts)",
-        min_value=10, max_value=5000,
-        value=min(500, len(filtered_df)),
+        "Max contracts to price",
+        min_value=1, max_value=n_chain,
+        value=n_chain,
         step=50,
         help=(
-            "Contracts are sorted by ATM distance + spread + volume; "
-            "the most liquid are priced first. "
-            "Set to total filtered count to price everything."
+            "Defaults to the full filtered chain. Lower it to price only a subset — "
+            "contracts are sorted by ATM distance + spread + volume, so the most "
+            "liquid are priced first."
         ),
     )
 

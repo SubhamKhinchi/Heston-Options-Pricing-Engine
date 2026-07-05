@@ -75,6 +75,7 @@ def filter_chain_with_stats(
     raw_df: pd.DataFrame,
     *,
     spread_limit: float = 0.05,
+    abs_spread_floor: float = 0.10,
     r: float = 0.0,
     q: float = 0.0,
     rate_curve: dict[float, float] | None = None,
@@ -100,6 +101,7 @@ def filter_chain_with_stats(
     filtered_df, stats = apply_filters(
         df,
         spread_limit=spread_limit,
+        abs_spread_floor=abs_spread_floor,
         r=r,
         q=q,
         rate_curve=rate_curve,

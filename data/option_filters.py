@@ -35,6 +35,7 @@ def apply_filters(
     df: pd.DataFrame,
     *,
     spread_limit: float = 0.05,
+    abs_spread_floor: float = 0.10,
     r: float = 0.0,
     q: float = 0.0,
     rate_curve: dict[float, float] | None = None,
@@ -64,9 +65,23 @@ def apply_filters(
     # 3. Bid-ask spread too wide — only drop contracts with a KNOWN wide spread.
     #    NaN rel_spread means bid=ask=0 (no live quote, price from lastPrice);
     #    these are kept here and may be dropped later by volume/OI filters.
+    #    Absolute-spread rescue: at low premiums the relative spread is floored by
+    #    the exchange tick size, not by illiquidity — a $0.30 option quoted a tick
+    #    or two wide can never pass a 5% relative test, so the pure relative gate
+    #    systematically evicts the cheap OTM wings that carry the smile's sigma/rho
+    #    information. A contract whose absolute spread is within abs_spread_floor
+    #    (~2 ticks) is kept even when its relative spread breaches the limit. The
+    #    rescue can only change outcomes for premiums <= abs_spread_floor/spread_limit
+    #    (the tick-floor regime); everything above is governed by the relative rule.
     if "rel_spread" in df.columns:
         known_wide = df["rel_spread"].notna() & (df["rel_spread"] >= spread_limit)
-        df = _drop(df, known_wide, f"Rel. spread ≥ {spread_limit:.0%}", stats)
+        if abs_spread_floor > 0 and {"bid", "ask"}.issubset(df.columns):
+            abs_spread = df["ask"] - df["bid"]
+            # Require a live bid: a $0.00/$0.05 quote is an unpriced contract, not a
+            # tight one — the rescue is for genuinely two-sided tick-width markets.
+            tick_tight = (df["bid"] > 0) & abs_spread.notna() & (abs_spread > 0) & (abs_spread <= abs_spread_floor)
+            known_wide &= ~tick_tight
+        df = _drop(df, known_wide, f"Rel. spread ≥ {spread_limit:.0%} (abs > ${abs_spread_floor:.2f})", stats)
 
     # 4. Moneyness outside band (keeps near-ATM contracts only). Prefer the
     #    forward-based measure K/F when available — it is the correct ATM metric;

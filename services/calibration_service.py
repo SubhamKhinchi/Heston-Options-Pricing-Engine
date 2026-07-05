@@ -28,25 +28,31 @@ import pandas as pd
 
 from analytics.schema import ensure_option_frame
 from calibration.calibrate_heston import calibrate_heston
+from calibration.data_driven_bounds import (
+    dynamic_v0_theta_bounds,
+    estimate_kappa0_from_chain,
+)
 from calibration.de_americanize import add_deamericanized_columns
 from calibration.heston_loss_function import iv_error_metrics
 from config.market_config import interpolate_rate
 from services.pricing_service import HestonParameters
 
 
-# Default search box and starting point follow Cui et al. (2016) rather than the
-# per-chain data-driven heuristics: the paper deliberately calibrates "without any
-# presumption on the values of the parameters" and shows the analytic-gradient LM
-# converges from broad, fixed ranges (their Table 5) — and even with no constraints
-# at all. DEFAULT_BOUNDS is Table 5; the guess is their representative start.
-# Note: Table 5's sigma ceiling (0.95) is calibrated to their validation set; high
-# vol-of-vol single names (e.g. NVDA) may need a wider sigma — set bounds per-run.
+# Default (fallback) search box. In the spirit of Cui et al. (2016) — whose point
+# is that the analytic-gradient LM needs neither a good start nor a tight box —
+# bounds here are guard rails that should never bind, not steering constraints.
+# The v0/θ slots below are STATIC FALLBACKS only: by default calibrate_option_chain
+# replaces them with dynamic_v0_theta_bounds() scaled to the chain's observed
+# deam_iv range (a fixed variance floor of 0.05 = 22.4% vol sits above the entire
+# SPX surface and pins 4 of 5 parameters — see calibration/data_driven_bounds.py).
+# The κ slot is likewise superseded: κ is fixed to the chain's ATM term-structure
+# κ₀ (fix_kappa=True) because the full surface does not identify it.
 DEFAULT_BOUNDS: list[tuple[float, float]] = [
-    (0.05, 0.95),     # v0
-    (0.50, 10.00),     # kappa
-    (0.05, 0.95),     # theta (long-run variance, v_bar)
-    (0.05, 3.00),     # sigma (vol-of-vol)
-    (-0.90, -0.10),   # rho
+    (0.001, 2.00),    # v0    (fallback; dynamic per-chain box used by default)
+    (0.05, 10.00),    # kappa (superseded by fixed κ₀ when fix_kappa=True)
+    (0.001, 2.00),    # theta (fallback; dynamic per-chain box used by default)
+    (0.05, 3.00),     # sigma (vol-of-vol; Cui ceiling raised for high-vol names)
+    (-0.95, -0.05),   # rho
 ]
 DEFAULT_INITIAL_GUESS = HestonParameters(v0=0.20, kappa=1.20, theta=0.20, sigma=0.30, rho=-0.60)
 CALIBRATION_CACHE_DIR = Path(__file__).resolve().parents[1] / "results" / "calibrations"
@@ -68,6 +74,15 @@ class CalibrationResult:
     # for internal/back-compat use. See heston_loss_function.iv_error_metrics.
     iv_rmse: float = float("nan")
     iv_mae: float = float("nan")
+    # κ handling: κ is fixed (not optimised) by default because the surface does
+    # not identify it. kappa_source records where the fixed value came from:
+    # "chain_term_structure" (trusted ATM term-structure fit), "fallback_default"
+    # (term structure uninformative — conventional κ₀), "caller" (explicit kappa0
+    # argument) or "free" (fix_kappa=False; κ optimised as before).
+    kappa_fixed: bool = False
+    kappa_source: str = "free"
+    kappa_se: float = float("nan")
+    kappa_half_life_months: float = float("nan")
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -79,6 +94,10 @@ class CalibrationResult:
             "loss": self.loss,
             "iv_rmse": self.iv_rmse,
             "iv_mae": self.iv_mae,
+            "kappa_fixed": self.kappa_fixed,
+            "kappa_source": self.kappa_source,
+            "kappa_se": self.kappa_se,
+            "kappa_half_life_months": self.kappa_half_life_months,
             "contract_count": self.contract_count,
             "objective": self.objective,
             "pricing_mode": self.pricing_mode,
@@ -277,7 +296,24 @@ def calibrate_option_chain(
     min_maturity: float = 0.0,
     max_maturity: float | None = None,
     weight_scheme: str = "vega",
+    fix_kappa: bool = True,
+    kappa0: float | None = None,
 ) -> tuple[CalibrationResult, pd.DataFrame]:
+    """Calibrate Heston parameters to the chain.
+
+    κ handling (fix_kappa, default True): κ is FIXED, not optimised — the full
+    surface does not identify it (the κ–σ degeneracy valley is flat, so a free κ
+    drifts to whatever bound the box imposes). The fixed value is `kappa0` when
+    given, else the chain's own ATM term-structure estimate clipped to a sane
+    range (calibration.data_driven_bounds.estimate_kappa0_from_chain), else a
+    conventional fallback when the chain has too few expiries to fit. Only
+    (v0, θ, σ, ρ) are optimised. Pass fix_kappa=False for the legacy free-κ fit.
+
+    Bounds (when `bounds` is None): v0/θ boxes are DYNAMIC guard rails scaled to
+    the chain's observed deam_iv range (dynamic_v0_theta_bounds); σ/ρ use the
+    fixed DEFAULT_BOUNDS slots. Caller-supplied `bounds` are respected as given,
+    except the κ slot, which is pinched to the fixed κ₀ while fix_kappa=True.
+    """
     # LM always minimises price residuals (Cui et al., 2016).
     # The objective parameter is retained for API compatibility only.
     if objective is None:
@@ -313,11 +349,60 @@ def calibrate_option_chain(
         else:
             calibration_df["r"] = r
 
-    # Search box: caller-supplied bounds, else the Cui et al. (2016) defaults.
-    # No per-chain data-driven boxing (the paper deliberately avoids presuming
-    # parameter values — see DEFAULT_BOUNDS).
+    # κ anchor + term-structure diagnostics. Estimated from the broad chain when
+    # possible (more expiries pin the term structure better than the maturity-
+    # windowed calibration universe); falls back to the universe itself when the
+    # caller passed a frame without deam_iv/forward columns.
+    kappa_info: dict | None = None
+    if fix_kappa:
+        kappa_info = estimate_kappa0_from_chain(options_df)
+        if kappa_info["n_expiries"] == 0:
+            kappa_info = estimate_kappa0_from_chain(calibration_df)
+        if kappa0 is not None:
+            kappa_info = dict(kappa_info)
+            kappa_info["kappa0"] = float(kappa0)
+            kappa_info["source"] = "caller"
+            kappa_info["half_life_months"] = float(np.log(2.0) / kappa0 * 12)
+        else:
+            kappa_info["source"] = (
+                "chain_term_structure" if kappa_info["trusted"] else "fallback_default"
+            )
+
+    # Search box. Caller bounds are respected as given; otherwise v0/θ get the
+    # dynamic per-chain guard rails (variance-level is the only genuinely
+    # ticker-sensitive box — see dynamic_v0_theta_bounds) and σ/ρ the fixed
+    # DEFAULT_BOUNDS slots. Either way the box is meant to never bind.
+    if bounds is not None:
+        effective_bounds = [tuple(b) for b in bounds]
+    else:
+        var_box = dynamic_v0_theta_bounds(
+            options_df if "deam_iv" in getattr(options_df, "columns", []) else calibration_df
+        )
+        effective_bounds = [
+            var_box,                # v0
+            DEFAULT_BOUNDS[1],      # kappa (pinched below when fix_kappa)
+            var_box,                # theta
+            DEFAULT_BOUNDS[3],      # sigma
+            DEFAULT_BOUNDS[4],      # rho
+        ]
+
     ig_list = list(initial_guess.as_tuple())
-    effective_bounds = bounds if bounds is not None else DEFAULT_BOUNDS
+
+    # Fix κ by pinching its box to κ₀·(1±1e-6): scipy's trf requires lb < ub
+    # strictly, and a width-zero direction is equivalent to removing κ from the
+    # optimisation. Applied on top of caller bounds too — fixed κ is the engine
+    # default, not a bounds preference.
+    if fix_kappa and kappa_info is not None:
+        k0 = float(kappa_info["kappa0"])
+        effective_bounds[1] = (k0 * (1.0 - 1e-6), k0 * (1.0 + 1e-6))
+        ig_list[1] = k0
+        # When the caller left the stock initial guess, seed v0/θ from the same
+        # term-structure fit — same surface, closer start, fewer LM iterations.
+        if initial_guess is DEFAULT_INITIAL_GUESS:
+            for slot, key in ((0, "v0_ts"), (2, "theta_ts")):
+                val = kappa_info.get(key, float("nan"))
+                if np.isfinite(val) and val > 0:
+                    ig_list[slot] = float(val)
 
     # Guarantee the initial guess lies inside the search box (scipy's
     # least_squares rejects an out-of-bounds start). Clamp each component.
@@ -354,5 +439,9 @@ def calibrate_option_chain(
         weight_scheme=weight_scheme,
         iv_rmse=float(iv_rmse),
         iv_mae=float(iv_mae),
+        kappa_fixed=bool(fix_kappa and kappa_info is not None),
+        kappa_source=(kappa_info["source"] if (fix_kappa and kappa_info) else "free"),
+        kappa_se=float(kappa_info.get("se_kappa", float("nan"))) if (fix_kappa and kappa_info) else float("nan"),
+        kappa_half_life_months=float(kappa_info.get("half_life_months", float("nan"))) if (fix_kappa and kappa_info) else float("nan"),
     )
     return result, calibration_df

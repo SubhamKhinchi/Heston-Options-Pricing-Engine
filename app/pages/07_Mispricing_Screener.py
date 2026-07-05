@@ -24,7 +24,7 @@ import plotly.express as px
 import streamlit as st
 
 st.set_page_config(page_title="Mispricing Screener", layout="wide")
-st.title("Step 7 — Mispricing Screener")
+st.title("Mispricing Screener")
 st.caption(
     "Six-lens analysis: ranked opportunities, put-call parity violations, "
     "systematic bias, volatility risk premium, strategy-level edge, and Greeks filter."
@@ -42,14 +42,14 @@ elif "filtered_df" in ss and not ss["filtered_df"].empty:
     has_model = False
     has_model_price = False
 else:
-    st.warning("No data available. Complete at least Step 2 — Filter Options first.")
+    st.warning("No data available. Complete at least **Filter Options** first.")
     st.page_link("pages/02_Filter_Options.py", label="← Go to Filter Options", icon="🔍")
     st.stop()
 
 if not has_model:
     st.warning(
         "Model IV not available — most screener lenses require Heston pricing. "
-        "Run **Step 4 — Price Contracts** first."
+        "Run **Price Contracts** first."
     )
     st.page_link("pages/04_Price_Contracts.py", label="← Go to Price Contracts", icon="💰")
     st.stop()
@@ -496,7 +496,7 @@ with tabs[4]:
     )
 
     if not has_model_price:
-        st.info("Model prices not available. Run Step 4 — Price Contracts to enable strategy edge.")
+        st.info("Model prices not available. Run **Price Contracts** to enable strategy edge.")
     elif "type" not in df.columns:
         st.info("Need call and put type column.")
     else:

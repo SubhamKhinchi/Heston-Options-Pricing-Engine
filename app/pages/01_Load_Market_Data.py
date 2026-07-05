@@ -1,5 +1,5 @@
 """
-Step 1 — Fetch Data.
+Step 1 — Load Market Data.
 
 Loads a live option chain (services/market_service.load_live_chain) and the
 SOFR/OIS discount curve (config/market_config), then stashes the raw chain and
@@ -31,8 +31,8 @@ from services.market_service import (
     parse_tickers,
 )
 
-st.set_page_config(page_title="Fetch Options Data", layout="wide")
-st.title("Step 1 — Fetch Options Data")
+st.set_page_config(page_title="Load Market Data", layout="wide")
+st.title("Load Market Data")
 st.caption("Pull a live option chain from Yahoo Finance. This is the starting point of the pipeline.")
 
 ss = st.session_state

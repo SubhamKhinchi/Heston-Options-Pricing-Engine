@@ -24,9 +24,11 @@ import plotly.express as px
 import streamlit as st
 
 from analytics.surfaces import build_surface_grid, select_otm_smile
+from calibration.implied_vol import implied_volatility
+from pricing.european_gl import heston_call_gl, heston_put_gl
 
 st.set_page_config(page_title="Volatility Surface", layout="wide")
-st.title("Step 5 — Volatility Surface Analysis")
+st.title("Volatility Surface Analysis")
 st.caption(
     "3D IV surface, smile/skew, term structure, forward variance, risk metrics, "
     "Greeks surfaces, and no-arbitrage checks."
@@ -46,23 +48,30 @@ elif "filtered_df" in ss and not ss["filtered_df"].empty:
     has_greeks = False
     data_label = "Filtered chain (no model)"
     st.info(
-        "Showing market data only. Run **Step 4 — Price Contracts** to add model IV, "
+        "Showing market data only. Run **Price Contracts** to add model IV, "
         "Heston Greeks, and mispricing data."
     )
 else:
-    st.warning("No data available. Complete at least Step 2 — Filter Options first.")
+    st.warning("No data available. Complete at least **Filter Options** first.")
     st.page_link("pages/02_Filter_Options.py", label="← Go to Filter Options", icon="🔍")
     st.stop()
 
 if "market_iv" not in df_full.columns or df_full["market_iv"].isna().all():
     st.error(
         "No implied volatility data found. "
-        "Market IV is computed during the pricing step — complete Step 4 first."
+        "Market IV is computed during pricing — run **Price Contracts** first."
     )
     st.page_link("pages/04_Price_Contracts.py", label="← Go to Price Contracts", icon="💰")
     st.stop()
 
 # ── Global controls ───────────────────────────────────────────────────────────
+# Option lists were trimmed (Calls/Puts-only basis and spot-moneyness axes removed);
+# clear stale widget state from an older session so the selectboxes don't error.
+if ss.get("vs_smile_basis") not in (None, "OTM only (clean)", "All quotes (raw)"):
+    del ss["vs_smile_basis"]
+if ss.get("vs_x_axis") not in (None, "forward_moneyness", "log_forward_moneyness", "strike"):
+    del ss["vs_x_axis"]
+
 ctrl1, ctrl2, ctrl3 = st.columns(3)
 
 with ctrl1:
@@ -78,23 +87,22 @@ with ctrl1:
 with ctrl2:
     smile_basis = st.selectbox(
         "Market smile basis",
-        options=["OTM only (clean)", "Calls only", "Puts only", "All quotes (raw)"],
+        options=["OTM only (clean)", "All quotes (raw)"],
         index=0,
         key="vs_smile_basis",
         help="OTM only keeps the liquid out-of-the-money leg per strike (one IV per "
-             "strike, no ITM noise or call/put double-count). 'All quotes' is the raw "
-             "both-legs view including ITM.",
+             "strike, no ITM noise or call/put double-count) — the working view. "
+             "'All quotes' is the raw both-legs view including ITM: use it to spot "
+             "bad quotes, not to analyse the smile.",
     )
 
 with ctrl3:
     x_axis_mode = st.selectbox(
         "X-axis (smile / surface)",
-        options=["forward_moneyness", "log_forward_moneyness", "moneyness", "log_moneyness", "strike"],
+        options=["forward_moneyness", "log_forward_moneyness", "strike"],
         format_func=lambda x: {
             "forward_moneyness": "Forward-moneyness  K/F",
             "log_forward_moneyness": "Log forward-moneyness  ln(K/F)",
-            "moneyness": "Spot-moneyness  K/S",
-            "log_moneyness": "Log spot-moneyness  ln(K/S)",
             "strike": "Strike price",
         }[x],
         index=0,
@@ -125,13 +133,9 @@ df["log_forward_moneyness"] = np.log(df["forward_moneyness"].clip(lower=1e-4))
 # Market smile basis — which contracts represent the smile at each strike.
 #  - "OTM only" keeps the liquid OTM leg per strike (one IV/strike, no ITM noise, no
 #    call/put double-count) — the clean, recommended representation (see select_otm_smile).
-#  - calls/puts isolate one type; "All quotes" keeps both legs incl. ITM (raw).
+#  - "All quotes (raw)" keeps both legs incl. ITM — a data-QC view.
 if smile_basis == "OTM only (clean)":
     df = select_otm_smile(df)
-elif smile_basis == "Calls only":
-    df = df[df["type"] == "call"].copy()
-elif smile_basis == "Puts only":
-    df = df[df["type"] == "put"].copy()
 
 x_col = x_axis_mode if x_axis_mode in df.columns else m_col
 df_iv = df.dropna(subset=["market_iv", "T", x_col]).copy()
@@ -182,7 +186,8 @@ _ATM_X = {
 # TAB 1 — IV SURFACE  (interactive Plotly 3D — drag to rotate)
 # ════════════════════════════════════════════════════════════════════════════
 def _surface_fig(df_src: pd.DataFrame, iv_col: str, title: str,
-                 colorscale: str = "Viridis") -> go.Figure | None:
+                 colorscale: str = "Viridis",
+                 z_range: tuple[float, float] | None = None) -> go.Figure | None:
     data = df_src[[x_col, "T", iv_col]].dropna()
     if len(data) < 8:
         return None
@@ -197,6 +202,9 @@ def _surface_fig(df_src: pd.DataFrame, iv_col: str, title: str,
         y=grid.y_grid,
         z=grid.z_grid * 100,
         colorscale=colorscale,
+        # Shared color limits across panels so the same IV maps to the same color.
+        cmin=z_range[0] if z_range else None,
+        cmax=z_range[1] if z_range else None,
         colorbar=dict(title="IV (%)"),
         hovertemplate=(
             f"{x_label}: %{{x:.3f}}<br>"
@@ -210,6 +218,8 @@ def _surface_fig(df_src: pd.DataFrame, iv_col: str, title: str,
             xaxis_title=x_label,
             yaxis_title="Maturity (yrs)",
             zaxis_title="IV (%)",
+            # Shared z-axis so smile/wing amplitudes are visually comparable.
+            zaxis=dict(range=list(z_range)) if z_range else dict(),
             camera=dict(eye=dict(x=1.4, y=-1.4, z=0.8)),
         ),
         height=550,
@@ -225,8 +235,21 @@ with tabs[tidx["📈 IV Surface"]]:
     n_cols = 2 if has_model else 1
     surf_cols = st.columns(n_cols)
 
+    # Shared z-axis + color range across market and model panels. Independent
+    # auto-scaling visually shrinks whichever surface spans more (the market's
+    # put wing) and stretches the flatter one (the model smile), making the two
+    # look more alike than they are — the comparison is the entire point here.
+    _z_cols = ["market_iv"] + (["model_iv"] if has_model else [])
+    _z_vals = pd.concat([df_iv[c] for c in _z_cols if c in df_iv.columns]).dropna() * 100
+    if len(_z_vals):
+        _pad = max(0.03 * (float(_z_vals.max()) - float(_z_vals.min())), 0.5)
+        shared_z = (float(_z_vals.min()) - _pad, float(_z_vals.max()) + _pad)
+    else:
+        shared_z = None
+
     with surf_cols[0]:
-        fig = _surface_fig(df_iv, "market_iv", "Market IV Surface", colorscale="Viridis")
+        fig = _surface_fig(df_iv, "market_iv", "Market IV Surface",
+                           colorscale="Viridis", z_range=shared_z)
         if fig:
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -236,7 +259,7 @@ with tabs[tidx["📈 IV Surface"]]:
         with surf_cols[1]:
             fig = _surface_fig(
                 df_iv.dropna(subset=["model_iv"]), "model_iv",
-                "Heston Model IV Surface", colorscale="Plasma",
+                "Heston Model IV Surface", colorscale="Plasma", z_range=shared_z,
             )
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
@@ -258,6 +281,51 @@ with tabs[tidx["📈 IV Surface"]]:
 with tabs[tidx["📐 Smile & Skew"]]:
     st.subheader("IV Smile & Skew per Expiry")
 
+    # Calibrated Heston parameters — used to draw a dense model smile curve
+    # (desk convention: market quotes are discrete points, the model is a smooth line).
+    _cal_meta = None
+    if isinstance(ss.get("calibration"), dict):
+        _cal_meta = (ss["calibration"].get("european_proxy") or {}).get("meta")
+    _heston_p = None
+    if _cal_meta and all(k in _cal_meta for k in ("v0", "kappa", "theta", "sigma", "rho")):
+        _heston_p = tuple(float(_cal_meta[k]) for k in ("v0", "kappa", "theta", "sigma", "rho"))
+
+    def _model_smile_curve(mdf: pd.DataFrame):
+        """Dense Heston IV curve across the expiry's strike range (OTM leg per point).
+
+        Pricing a 60-strike grid through the GL pricer costs milliseconds and shows the
+        model's smile between/beyond the quoted strikes instead of a jagged polyline
+        through whatever strikes happen to trade. Returns (x, iv) in the current x-axis
+        convention, or None when no calibration is in session.
+        """
+        if _heston_p is None or mdf.empty:
+            return None
+        row = mdf.iloc[0]
+        S, T_val = float(row["spot"]), float(row["T"])
+        F = float(row["forward"]) if "forward" in mdf.columns and pd.notna(row["forward"]) else S
+        rr_ = float(mdf["r"].median()) if "r" in mdf.columns else 0.045
+        qq_ = float(mdf["q"].median()) if "q" in mdf.columns else 0.0
+        v0_, ka_, th_, sg_, rh_ = _heston_p
+        xs, ivs = [], []
+        for K in np.linspace(float(mdf["strike"].min()), float(mdf["strike"].max()), 60):
+            is_call = K > F
+            try:
+                px = (heston_call_gl if is_call else heston_put_gl)(
+                    S, K, rr_, T_val, v0_, ka_, th_, sg_, rh_, qq_)
+                iv = implied_volatility(heston_model_price=px, S=S, K=K, r=rr_, T=T_val,
+                                        option_type="call" if is_call else "put", q=qq_)
+            except Exception:
+                iv = np.nan
+            if iv is not None and np.isfinite(iv) and iv > 0:
+                if x_axis_mode == "strike":
+                    xs.append(float(K))
+                elif x_axis_mode == "log_forward_moneyness":
+                    xs.append(float(np.log(K / F)))
+                else:
+                    xs.append(float(K / F))
+                ivs.append(float(iv))
+        return (xs, ivs) if len(ivs) >= 5 else None
+
     maturities = sorted(df_iv["maturity"].unique()) if "maturity" in df_iv.columns else []
     if not maturities:
         st.info("No maturity data available.")
@@ -271,7 +339,7 @@ with tabs[tidx["📐 Smile & Skew"]]:
                 key="vs_smile_mats",
             )
             show_model_smile = has_model and st.checkbox(
-                "Overlay Heston IV", value=True, key="vs_smile_model"
+                "Overlay Heston smile", value=True, key="vs_smile_model"
             )
 
         with sm_right:
@@ -286,27 +354,37 @@ with tabs[tidx["📐 Smile & Skew"]]:
                     clr = palette[i % len(palette)]
                     T_val = mdf["T"].iloc[0] if not mdf.empty else 0
 
+                    # Market quotes as points — connecting them just draws quote noise.
                     fig_sm.add_trace(go.Scatter(
                         x=mdf[x_col],
                         y=mdf["market_iv"] * 100,
-                        mode="markers+lines",
-                        name=f"{mat} (T={T_val:.2f}y) Market",
+                        mode="markers",
+                        name=f"{mat} (T={T_val:.2f}y) market",
                         marker=dict(color=clr, size=6),
-                        line=dict(color=clr),
                         hovertemplate=f"{mat}<br>{x_label}: %{{x:.3f}}<br>Market IV: %{{y:.2f}}%<extra></extra>",
                     ))
 
-                    if show_model_smile and has_model:
-                        mdf_m = mdf.dropna(subset=["model_iv"])
-                        if not mdf_m.empty:
+                    if show_model_smile:
+                        curve = _model_smile_curve(mdf)
+                        if curve is not None:
                             fig_sm.add_trace(go.Scatter(
-                                x=mdf_m[x_col],
-                                y=mdf_m["model_iv"] * 100,
+                                x=curve[0], y=np.asarray(curve[1]) * 100,
                                 mode="lines",
                                 name=f"{mat} Heston",
-                                line=dict(color=clr, dash="dash"),
+                                line=dict(color=clr, width=2),
                                 hovertemplate=f"{mat}<br>{x_label}: %{{x:.3f}}<br>Heston IV: %{{y:.2f}}%<extra></extra>",
                             ))
+                        elif has_model:
+                            # No calibration in session — fall back to model IV at quoted strikes.
+                            mdf_m = mdf.dropna(subset=["model_iv"])
+                            if not mdf_m.empty:
+                                fig_sm.add_trace(go.Scatter(
+                                    x=mdf_m[x_col], y=mdf_m["model_iv"] * 100,
+                                    mode="lines",
+                                    name=f"{mat} Heston (at quotes)",
+                                    line=dict(color=clr, dash="dash"),
+                                    hovertemplate=f"{mat}<br>{x_label}: %{{x:.3f}}<br>Heston IV: %{{y:.2f}}%<extra></extra>",
+                                ))
 
                 atm_x = _ATM_X.get(x_axis_mode)
                 if atm_x is not None:
@@ -325,28 +403,146 @@ with tabs[tidx["📐 Smile & Skew"]]:
                 )
                 st.plotly_chart(fig_sm, use_container_width=True)
 
-        # Skew table
-        st.subheader(f"Skew Summary (90%–110% {m_label})")
-        skew_rows = []
-        for mat in maturities:
-            mdf = df_iv[df_iv["maturity"] == mat]
-            T_val = mdf["T"].iloc[0]
-            near_atm = mdf[mdf[m_col].between(0.97, 1.03)]
-            if near_atm.empty:
-                near_atm = mdf.loc[(mdf[m_col] - 1.0).abs().nsmallest(2).index]
-            atm_iv = near_atm["market_iv"].mean()
-            put_iv = mdf[mdf[m_col].between(0.85, 0.95)]["market_iv"].mean()
-            call_iv = mdf[mdf[m_col].between(1.05, 1.15)]["market_iv"].mean()
-            skew_rows.append({
-                "Expiry": mat,
-                "T (yrs)": round(T_val, 3),
-                "ATM IV": f"{atm_iv*100:.2f}%" if pd.notna(atm_iv) else "—",
-                "90% IV (OTM Put)": f"{put_iv*100:.2f}%" if pd.notna(put_iv) else "—",
-                "110% IV (OTM Call)": f"{call_iv*100:.2f}%" if pd.notna(call_iv) else "—",
-                "Skew (90%−110%)": f"{(put_iv-call_iv)*100:.2f}%" if pd.notna(put_iv) and pd.notna(call_iv) else "—",
+        # ── ATM / 25Δ risk reversal / 25Δ butterfly — market vs model ────────────
+        st.subheader("Smile Metrics — ATM / 25Δ Risk Reversal / 25Δ Butterfly")
+        st.caption(
+            "Desk-standard smile decomposition in **delta** buckets — 25Δ marks the same "
+            "distributional position at every maturity, which fixed moneyness does not. "
+            "RR = 25Δ put IV − 25Δ call IV (equity convention: > 0 = put skew, ↔ ρ). "
+            "Fly = ½(25Δ put + 25Δ call) − ATM (smile curvature, ↔ vol-of-vol σ). "
+            "Model values use the model's own IV and delta, so the ΔRR/ΔFly columns are "
+            "the per-expiry read on how much skew/curvature Heston concedes to the market."
+        )
+
+        if "market_delta" not in df_iv.columns or df_iv["market_delta"].isna().all():
+            st.info("Delta buckets need Greeks — run **Price Contracts** first.")
+        else:
+            _mdl_dcol = "model_delta" if "model_delta" in df_iv.columns else "market_delta"
+
+            def _iv_at_delta(sub: pd.DataFrame, iv_col: str, d_col: str,
+                             target: float = 0.25) -> float:
+                """IV linearly interpolated at |delta| = target; NaN when not bracketed."""
+                s = sub.dropna(subset=[iv_col, d_col]).copy()
+                if len(s) < 2:
+                    return float("nan")
+                s["_ad"] = s[d_col].abs()
+                s = s[(s["_ad"] > 0.02) & (s["_ad"] < 0.98)].sort_values("_ad").drop_duplicates("_ad")
+                if len(s) < 2 or not (s["_ad"].iloc[0] <= target <= s["_ad"].iloc[-1]):
+                    return float("nan")
+                return float(np.interp(target, s["_ad"].values, s[iv_col].values))
+
+            rows25 = []
+            for mat in maturities:
+                mdf = df_iv[df_iv["maturity"] == mat]
+                T_val = float(mdf["T"].iloc[0])
+                puts = mdf[mdf["type"] == "put"] if "type" in mdf.columns else mdf.iloc[0:0]
+                calls = mdf[mdf["type"] == "call"] if "type" in mdf.columns else mdf.iloc[0:0]
+
+                # ATM from the bracketing pair around the forward (same construction as
+                # the κ₀ estimator): nearest call at K ≥ F + nearest put at K ≤ F, averaged.
+                brackets = []
+                for side in (calls[calls[m_col] >= 1.0], puts[puts[m_col] <= 1.0]):
+                    side = side.dropna(subset=["market_iv"])
+                    if len(side):
+                        brackets.append(side.loc[(side[m_col] - 1.0).abs().idxmin()])
+                atm_mkt = float(np.mean([b["market_iv"] for b in brackets])) if brackets else float("nan")
+                atm_mdl = (float(np.nanmean([b.get("model_iv", np.nan) for b in brackets]))
+                           if brackets and has_model else float("nan"))
+
+                p_mkt = _iv_at_delta(puts, "market_iv", "market_delta")
+                c_mkt = _iv_at_delta(calls, "market_iv", "market_delta")
+                p_mdl = _iv_at_delta(puts, "model_iv", _mdl_dcol) if has_model else float("nan")
+                c_mdl = _iv_at_delta(calls, "model_iv", _mdl_dcol) if has_model else float("nan")
+
+                rows25.append({
+                    "Expiry": mat, "T": T_val,
+                    "atm_mkt": atm_mkt, "atm_mdl": atm_mdl,
+                    "rr_mkt": p_mkt - c_mkt, "rr_mdl": p_mdl - c_mdl,
+                    "fly_mkt": 0.5 * (p_mkt + c_mkt) - atm_mkt,
+                    "fly_mdl": 0.5 * (p_mdl + c_mdl) - atm_mdl,
+                })
+
+            m25 = pd.DataFrame(rows25).sort_values("T")
+
+            sk1, sk2 = st.columns(2)
+            with sk1:
+                fig_rr = go.Figure()
+                fig_rr.add_trace(go.Scatter(
+                    x=m25["T"], y=m25["rr_mkt"] * 100, mode="markers+lines",
+                    name="Market RR", line=dict(color="#4C78A8"), marker=dict(size=7),
+                    hovertemplate="T=%{x:.3f}y<br>RR=%{y:.2f} vol pts<extra>Market</extra>",
+                ))
+                if has_model and m25["rr_mdl"].notna().any():
+                    fig_rr.add_trace(go.Scatter(
+                        x=m25["T"], y=m25["rr_mdl"] * 100, mode="markers+lines",
+                        name="Heston RR", line=dict(color="#E45756", dash="dash"),
+                        marker=dict(size=6),
+                        hovertemplate="T=%{x:.3f}y<br>RR=%{y:.2f} vol pts<extra>Heston</extra>",
+                    ))
+                # Empirical benchmark: equity skew decays roughly like 1/√T. Anchored to
+                # the first liquid market point past ~5 weeks.
+                ref = m25.dropna(subset=["rr_mkt"])
+                ref = ref[ref["T"] >= 0.1]
+                if len(ref) >= 2:
+                    T0, rr0 = float(ref["T"].iloc[0]), float(ref["rr_mkt"].iloc[0])
+                    Tg_ = np.linspace(max(float(m25["T"].min()), 0.02), float(m25["T"].max()), 100)
+                    fig_rr.add_trace(go.Scatter(
+                        x=Tg_, y=rr0 * np.sqrt(T0 / Tg_) * 100, mode="lines",
+                        name="∝ 1/√T reference", line=dict(color="gray", dash="dot", width=1),
+                        hoverinfo="skip",
+                    ))
+                fig_rr.add_hline(y=0, line_dash="dot", line_color="gray")
+                fig_rr.update_layout(
+                    title="25Δ Risk Reversal Term Structure  (skew decay)",
+                    xaxis_title="Maturity (years)", yaxis_title="RR (vol pts)",
+                    height=380, legend=dict(orientation="h", yanchor="bottom", y=1.0),
+                )
+                st.plotly_chart(fig_rr, use_container_width=True)
+
+            with sk2:
+                fig_fl = go.Figure()
+                fig_fl.add_trace(go.Scatter(
+                    x=m25["T"], y=m25["fly_mkt"] * 100, mode="markers+lines",
+                    name="Market fly", line=dict(color="#4C78A8"), marker=dict(size=7),
+                    hovertemplate="T=%{x:.3f}y<br>Fly=%{y:.2f} vol pts<extra>Market</extra>",
+                ))
+                if has_model and m25["fly_mdl"].notna().any():
+                    fig_fl.add_trace(go.Scatter(
+                        x=m25["T"], y=m25["fly_mdl"] * 100, mode="markers+lines",
+                        name="Heston fly", line=dict(color="#E45756", dash="dash"),
+                        marker=dict(size=6),
+                        hovertemplate="T=%{x:.3f}y<br>Fly=%{y:.2f} vol pts<extra>Heston</extra>",
+                    ))
+                fig_fl.add_hline(y=0, line_dash="dot", line_color="gray")
+                fig_fl.update_layout(
+                    title="25Δ Butterfly Term Structure  (smile curvature)",
+                    xaxis_title="Maturity (years)", yaxis_title="Fly (vol pts)",
+                    height=380, legend=dict(orientation="h", yanchor="bottom", y=1.0),
+                )
+                st.plotly_chart(fig_fl, use_container_width=True)
+
+            disp = m25.copy()
+            disp["ΔRR (mkt−mdl)"] = (m25["rr_mkt"] - m25["rr_mdl"]).apply(
+                lambda x: f"{x*100:+.2f}%" if pd.notna(x) else "—")
+            disp["ΔFly (mkt−mdl)"] = (m25["fly_mkt"] - m25["fly_mdl"]).apply(
+                lambda x: f"{x*100:+.2f}%" if pd.notna(x) else "—")
+            for c_ in ["atm_mkt", "atm_mdl", "rr_mkt", "rr_mdl", "fly_mkt", "fly_mdl"]:
+                disp[c_] = disp[c_].apply(lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—")
+            disp["T"] = disp["T"].round(3)
+            disp = disp.rename(columns={
+                "atm_mkt": "ATM mkt", "atm_mdl": "ATM mdl",
+                "rr_mkt": "25Δ RR mkt", "rr_mdl": "25Δ RR mdl",
+                "fly_mkt": "25Δ Fly mkt", "fly_mdl": "25Δ Fly mdl",
             })
-        if skew_rows:
-            st.dataframe(pd.DataFrame(skew_rows), use_container_width=True, hide_index=True)
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+            st.caption(
+                "— rows: the chain's strikes never reach 25Δ at that expiry. The broad "
+                "filter keeps K/F ∈ [0.8, 1.2], which at long maturities spans well under "
+                "one standard deviation — e.g. at T≈2.5y and ~42% vol, even K/F=1.2 still "
+                "carries Δ≈0.5. RR/fly are therefore only measurable at the short end "
+                "unless the filter band is widened (or made delta-aware, the desk "
+                "convention — e.g. keep |Δ| ∈ [0.05, 0.95])."
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -493,8 +493,17 @@ This function is used for computing **market IV** from observed mid-prices and f
 
 ### 9.1 Overview
 
-The calibration fits `(v0, kappa, theta, sigma, rho)` by **nonlinear least squares** on price
-residuals, following Cui et al. (2016):
+The calibration fits `(v0, theta, sigma, rho)` by **nonlinear least squares** on price
+residuals, following Cui et al. (2016). `kappa` is **fixed, not optimised**: the option
+surface does not identify it (kappa and sigma trade off along a near-flat valley, so a
+free kappa drifts to whatever bound the search box imposes). Instead kappa0 is estimated
+from the chain's own ATM average-variance term structure,
+`w(T)/T = theta + (v0 - theta)(1 - e^(-kappa*T))/(kappa*T)` — a Q-measure estimate with no
+historical data — clipped to [0.5, 12] and held fixed (fallback kappa0 = 2.0 only when
+fewer than 4 expiries are usable; kappa's standard error is reported as a diagnostic, not
+used as a gate).
+v0/theta search bounds are dynamic guard rails scaled to the chain's observed
+de-Americanized IV range, so the box adapts per ticker and should never bind:
 
 ```
 r_i(θ) = w_i · (C_model(θ; K_i, T_i) − C*_i)      f(θ) = ½ ‖r(θ)‖²
