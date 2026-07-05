@@ -27,7 +27,7 @@ from strategies.contracts import OptionLeg
 from strategies.payoff import strategy_payoff, estimate_break_even_points, price_grid
 
 st.set_page_config(page_title="Strategy Lab", layout="wide")
-st.title("Step 6 — Strategy Lab")
+st.title("Strategy Lab")
 st.caption(
     "Build, inspect, and analyse multi-leg options strategies using live market data. "
     "Visualise P&L profiles, net Greeks, breakevens, and strategy metrics."
@@ -44,9 +44,9 @@ elif "filtered_df" in ss and not ss["filtered_df"].empty:
     chain = ss["filtered_df"].copy()
     greek_prefix = "market"
     has_model_price = False
-    st.info("Using filtered chain (no model prices). Run Step 4 to add Heston pricing.")
+    st.info("Using filtered chain (no model prices). Run **Price Contracts** to add Heston pricing.")
 else:
-    st.warning("No data available. Complete at least Step 2 — Filter Options first.")
+    st.warning("No data available. Complete at least **Filter Options** first.")
     st.page_link("pages/02_Filter_Options.py", label="← Go to Filter Options", icon="🔍")
     st.stop()
 

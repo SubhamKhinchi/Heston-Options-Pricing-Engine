@@ -304,9 +304,9 @@ def calibrate_option_chain(
     κ handling (fix_kappa, default True): κ is FIXED, not optimised — the full
     surface does not identify it (the κ–σ degeneracy valley is flat, so a free κ
     drifts to whatever bound the box imposes). The fixed value is `kappa0` when
-    given, else the chain's own ATM term-structure estimate
-    (calibration.data_driven_bounds.estimate_kappa0_from_chain), else a
-    conventional fallback when the term structure is uninformative. Only
+    given, else the chain's own ATM term-structure estimate clipped to a sane
+    range (calibration.data_driven_bounds.estimate_kappa0_from_chain), else a
+    conventional fallback when the chain has too few expiries to fit. Only
     (v0, θ, σ, ρ) are optimised. Pass fix_kappa=False for the legacy free-κ fit.
 
     Bounds (when `bounds` is None): v0/θ boxes are DYNAMIC guard rails scaled to

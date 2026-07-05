@@ -499,7 +499,9 @@ surface does not identify it (kappa and sigma trade off along a near-flat valley
 free kappa drifts to whatever bound the search box imposes). Instead kappa0 is estimated
 from the chain's own ATM average-variance term structure,
 `w(T)/T = theta + (v0 - theta)(1 - e^(-kappa*T))/(kappa*T)` — a Q-measure estimate with no
-historical data — and held fixed (fallback kappa0 = 2.0 when the term structure is flat).
+historical data — clipped to [0.5, 12] and held fixed (fallback kappa0 = 2.0 only when
+fewer than 4 expiries are usable; kappa's standard error is reported as a diagnostic, not
+used as a gate).
 v0/theta search bounds are dynamic guard rails scaled to the chain's observed
 de-Americanized IV range, so the box adapts per ticker and should never bind:
 

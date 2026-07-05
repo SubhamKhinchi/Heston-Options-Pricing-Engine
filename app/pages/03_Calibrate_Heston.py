@@ -40,7 +40,7 @@ from services.market_service import parse_tickers
 from services.pricing_service import HestonParameters
 
 st.set_page_config(page_title="Calibrate Heston", layout="wide")
-st.title("Step 3 — Calibrate Heston Model")
+st.title("Calibrate Heston Model")
 st.caption(
     "Fit four Heston parameters (v₀, θ̄, σ, ρ) to the de-Americanized option chain "
     "using the Levenberg-Marquardt optimiser with the analytic Cui et al. (2016) "
@@ -51,8 +51,8 @@ ss = st.session_state
 
 # ── Prerequisite checks ───────────────────────────────────────────────────────
 if "raw_df" not in ss:
-    st.warning("No data loaded. Go to **Fetch Data** first.")
-    st.page_link("pages/01_Fetch_Data.py", label="← Go to Fetch Data", icon="📥")
+    st.warning("No data loaded. Go to **Load Market Data** first.")
+    st.page_link("pages/01_Load_Market_Data.py", label="← Go to Load Market Data", icon="📥")
     st.stop()
 
 if "filtered_df" not in ss:
@@ -69,7 +69,7 @@ q = params.get("q", 0.0)
 if not rate_curve:
     st.warning(
         f"⚠️ SOFR/OIS rates unavailable — using {r*100:.2f}% flat rate. "
-        "Go to Fetch Data and refresh rates to reload the curve."
+        "Go to Load Market Data and refresh rates to reload the curve."
     )
 
 if filtered_df.empty:
@@ -184,21 +184,22 @@ _kc1.metric("κ₀ (mean-reversion speed)", f"{_k0:.2f}")
 _kc2.metric("Variance half-life", f"{_kappa_info['half_life_months']:.1f} mo")
 _kc3.metric(
     "Source",
-    "ATM term structure" if _kappa_info["trusted"] else "fallback (κ₀ = 2.0)",
+    ("ATM term structure" + (" (clipped)" if _kappa_info.get("clipped") else ""))
+    if _kappa_info["trusted"] else "fallback (κ₀ = 2.0)",
 )
 st.caption(
     "κ is **not optimised** — the option surface doesn't identify it (κ and σ trade "
-    "off along a near-flat valley, so a free κ just drifts to a bound). Instead, κ₀ "
-    "is read off this chain's ATM variance term structure: one ATM implied variance "
-    "per expiry, fit to the Heston curve  w(T)/T = θ̄ + (v₀−θ̄)(1−e^{−κT})/(κT), "
-    "where κ is the speed at which short-dated variance bends to the long-run level. "
-    "Risk-neutral by construction — no historical data involved."
+    "off along a near-flat valley, so a free κ just drifts to a bound; Bloomberg's "
+    "OVML fixes mean reversion for the same reason). Instead, κ₀ is read off this "
+    "chain's ATM variance term structure: one ATM implied variance per expiry, fit "
+    "to the Heston curve  w(T)/T = θ̄ + (v₀−θ̄)(1−e^{−κT})/(κT), where κ is the speed "
+    "at which short-dated variance bends to the long-run level, then clipped to a "
+    "sane range [0.5, 12]. Risk-neutral by construction — no historical data involved."
 )
 if not _kappa_info["trusted"]:
     st.warning(
-        "This chain's ATM term structure is too flat or too short to pin κ "
-        "(no method can recover κ from a flat term structure) — using the "
-        "conventional fallback κ₀ = 2.0."
+        f"Only {_kappa_info['n_expiries']} usable expiries — the term-structure fit "
+        "needs at least 4, so the conventional fallback κ₀ = 2.0 is used."
     )
 
 # ── Initial parameters & search bounds (v₀, θ̄, σ, ρ) ─────────────────────────
@@ -277,7 +278,7 @@ def _render_result(meta: dict, cal_df: pd.DataFrame | None) -> None:
         kappa_note = (
             f"fixed — κ₀ from ATM term structure{hl_txt}"
             if meta.get("kappa_source") == "chain_term_structure"
-            else f"fixed — fallback κ₀ (flat term structure){hl_txt}"
+            else f"fixed — fallback κ₀ (too few expiries){hl_txt}"
         )
     else:
         kappa_note = "mean-reversion speed (optimised)"

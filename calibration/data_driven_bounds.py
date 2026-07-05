@@ -37,6 +37,7 @@ def estimate_kappa0_from_chain(
     atm_band: float = 0.10,
     fallback: float = 2.0,
     kappa_fit_bounds: tuple[float, float] = (0.05, 20.0),
+    kappa_range: tuple[float, float] = (0.5, 12.0),
 ) -> dict:
     """
     Estimate the Heston mean-reversion speed κ₀ from the option chain itself.
@@ -55,22 +56,30 @@ def estimate_kappa0_from_chain(
     assumption — and it is the anchor used to FIX κ in calibration (κ is not
     identified by the full surface; see module docstring).
 
-    Trust checks (`trusted=False` falls back to ``fallback``): enough expiries
-    and term-structure length, a genuinely sloped term structure (flat ⇒ the
-    (v0−θ) factor kills the κ term and no method can recover κ), κ resolved
-    relative to its standard error, and κ not parked at the pre-fit's own box.
+    Policy — deliberately simple (cf. Bloomberg OVML, which fixes mean reversion
+    to a conventional value outright because of the κ–σ "interplay of opposing
+    roles"): whenever the curve fit can run (≥ 4 usable expiries), use the fitted
+    κ **clipped to ``kappa_range``**. κ is weakly identified and the full
+    calibration barely reacts inside that range, so a bounded chain-consistent
+    estimate always beats switching to an arbitrary constant — earlier binary
+    trust gates (slope / relative-se thresholds) flipped marginal chains between
+    κ≈6 and the 2.0 fallback on day-to-day quote noise. ``fallback`` is used only
+    when the fit cannot run at all (missing columns or < 4 expiries). ``se_kappa``
+    is reported as a display-only diagnostic, not a gate; the clip handles the
+    flat-term-structure artifact case (where the fitted κ is an arbitrary point
+    in a flat valley) by bounding the damage instead of pretending to detect it.
 
     Requires columns: T, strike, forward, type, deam_iv, atm_distance
     (all present on any chain out of market_service.filter_chain_with_stats).
 
-    Returns dict with: kappa0, kappa0_raw, trusted, v0_ts, theta_ts, se_kappa,
-    n_expiries, half_life_months, ts_points (list of (T, atm_variance)).
+    Returns dict with: kappa0, kappa0_raw, trusted (fit ran), clipped, v0_ts,
+    theta_ts, se_kappa, n_expiries, half_life_months, ts_points [(T, atm_var)].
     """
     needed = {"T", "strike", "forward", "type", "deam_iv", "atm_distance"}
     if chain is None or chain.empty or not needed.issubset(chain.columns):
         return {"kappa0": fallback, "kappa0_raw": float("nan"), "trusted": False,
                 "v0_ts": float("nan"), "theta_ts": float("nan"),
-                "se_kappa": float("nan"), "n_expiries": 0,
+                "se_kappa": float("nan"), "n_expiries": 0, "clipped": False,
                 "half_life_months": float(np.log(2.0) / fallback * 12),
                 "ts_points": [],
                 "warning": "chain missing deam_iv/forward columns — fallback κ₀ used"}
@@ -89,11 +98,11 @@ def estimate_kappa0_from_chain(
             pts.append((float(T), float(np.mean(ivs)) ** 2))
 
     out = {"kappa0": fallback, "kappa0_raw": float("nan"), "trusted": False,
-           "v0_ts": float("nan"), "theta_ts": float("nan"), "se_kappa": float("nan"),
-           "n_expiries": len(pts), "ts_points": pts,
+           "clipped": False, "v0_ts": float("nan"), "theta_ts": float("nan"),
+           "se_kappa": float("nan"), "n_expiries": len(pts), "ts_points": pts,
            "half_life_months": float(np.log(2.0) / fallback * 12)}
     if len(pts) < 4:
-        out["warning"] = f"only {len(pts)} usable expiries — fallback κ₀ used"
+        out["warning"] = f"only {len(pts)} usable expiries — the term-structure fit needs ≥4; fallback κ₀ used"
         return out
 
     Ts = np.array([p[0] for p in pts])
@@ -119,27 +128,14 @@ def estimate_kappa0_from_chain(
     except Exception:
         se_k = float("nan")
 
-    # Trust checks. The se gate is the primary flatness detector: a flat term
-    # structure makes κ unidentifiable and the fit covariance explodes (se ≫ κ),
-    # so a strict relative-se test catches it directly. The slope gate is kept
-    # only as a mild backstop — a hard slope threshold double-counts the se
-    # information and flips marginal chains (e.g. NVDA at ~0.25 relative slope)
-    # between trusted and fallback on day-to-day quote noise.
-    trusted = bool(
-        len(Ts) >= 5
-        and Ts.max() >= 0.4                              # enough term structure to bend
-        and abs(v0_ts - theta_ts) > 0.10 * max(v0_ts, theta_ts)   # TS not literally flat
-        and np.isfinite(se_k) and se_k < 0.6 * k         # κ resolved vs its own error
-        and lo_k * 1.5 < k < hi_k / 1.5                  # not parked at the pre-fit box
-    )
-    kappa0 = k if trusted else fallback
+    # The fit ran: use its κ, clipped. No trust gates — see docstring.
+    kappa0 = float(np.clip(k, *kappa_range))
     out.update({
-        "kappa0": float(kappa0), "kappa0_raw": k, "trusted": trusted,
+        "kappa0": kappa0, "kappa0_raw": k, "trusted": True,
+        "clipped": bool(kappa0 != k),
         "v0_ts": v0_ts, "theta_ts": theta_ts, "se_kappa": se_k,
         "half_life_months": float(np.log(2.0) / kappa0 * 12),
     })
-    if not trusted:
-        out["warning"] = "ATM term structure uninformative about κ — fallback κ₀ used"
     return out
 
 

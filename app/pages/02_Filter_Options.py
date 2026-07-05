@@ -3,7 +3,7 @@ Step 2 — Filter Options.
 
 Applies liquidity / no-arbitrage filters (services/market_service.filter_chain_with_stats)
 to the raw chain from Step 1 and stashes the filtered chain in session state.
-Upstream: Step 1 (Fetch Data). Downstream: Step 3 (Calibrate Heston).
+Upstream: Step 1 (Load Market Data). Downstream: Step 3 (Calibrate Heston).
 """
 
 from __future__ import annotations
@@ -25,15 +25,15 @@ import streamlit as st
 from services.market_service import filter_chain_with_stats, parse_tickers
 
 st.set_page_config(page_title="Filter Options", layout="wide")
-st.title("Step 2 — Filter Options")
+st.title("Filter Options")
 st.caption("Apply liquidity and model-quality filters to the raw option chain.")
 
 ss = st.session_state
 
 # ── Prerequisite check ────────────────────────────────────────────────────────
 if "raw_df" not in ss:
-    st.warning("No data loaded yet. Go to **Fetch Data** first and pull an option chain.")
-    st.page_link("pages/01_Fetch_Data.py", label="← Go to Fetch Data", icon="📥")
+    st.warning("No data loaded yet. Go to **Load Market Data** first and pull an option chain.")
+    st.page_link("pages/01_Load_Market_Data.py", label="← Go to Load Market Data", icon="📥")
     st.stop()
 
 raw_df: pd.DataFrame = ss["raw_df"]
@@ -45,7 +45,7 @@ r = ss.get("r_scalar", params.get("r", 0.045))
 if not rate_curve:
     st.warning(
         f"⚠️ SOFR/OIS rates unavailable — using {r*100:.2f}% flat rate. "
-        "Go to Fetch Data and refresh rates to reload the curve."
+        "Go to Load Market Data and refresh rates to reload the curve."
     )
 
 # Per-ticker status line
@@ -81,15 +81,25 @@ with col1:
         help="Contracts with a known spread wider than this are dropped. "
              "Contracts with no live quote (bid=ask=0) are kept — they use lastPrice.",
     )
+    abs_spread_floor = st.number_input(
+        "Absolute spread rescue floor ($)",
+        min_value=0.0, max_value=5.0,
+        value=prev.get("abs_spread_floor", 0.10),
+        step=0.05, format="%.2f",
+        help="Contracts that fail the relative-spread gate are kept anyway if their "
+             "absolute bid-ask spread (ask−bid) is at or below this floor and they have "
+             "a live bid — at low premiums the relative spread measures tick size, not "
+             "illiquidity. Default $0.10 ≈ 2 ticks; set to 0 to disable the rescue.",
+    )
     min_volume = st.number_input(
         "Min daily volume",
-        min_value=0, value=prev.get("min_volume", 100), step=10,
-        help="Set to 0 outside market hours — yfinance volume is 0 for stale quotes.",
+        min_value=0, value=prev.get("min_volume", 0), step=10,
+        help="Keep at 0 outside market hours — yfinance volume is 0 for stale quotes.",
     )
     min_open_interest = st.number_input(
         "Min open interest",
-        min_value=0, value=prev.get("min_open_interest", 1000), step=100,
-        help="Set to 0 outside market hours — yfinance returns OI=0 for stale quotes.",
+        min_value=0, value=prev.get("min_open_interest", 0), step=100,
+        help="Keep at 0 outside market hours — yfinance returns OI=0 for stale quotes.",
     )
     option_types = st.multiselect(
         "Option types",
@@ -138,6 +148,7 @@ filter_clicked = st.button("Apply Filters", type="primary")
 if filter_clicked:
     filter_params = dict(
         spread_limit=spread_limit,
+        abs_spread_floor=float(abs_spread_floor),
         r=r,
         q=params.get("q", 0.0),
         rate_curve=rate_curve,
@@ -278,6 +289,6 @@ if not filtered_df.empty:
 st.divider()
 col_back, col_fwd = st.columns([1, 1])
 with col_back:
-    st.page_link("pages/01_Fetch_Data.py", label="← Back to Fetch Data", icon="📥")
+    st.page_link("pages/01_Load_Market_Data.py", label="← Back to Load Market Data", icon="📥")
 with col_fwd:
     st.page_link("pages/03_Calibrate_Heston.py", label="Next: Calibrate Heston →", icon="⚙️")
