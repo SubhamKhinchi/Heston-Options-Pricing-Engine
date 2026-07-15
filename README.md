@@ -52,6 +52,6 @@ Data is live-only; the app and pipelines both need network access.
 | `models/`, `pricing/` | Cui (2016) CF + analytic gradient; 64-node GL European pricer |
 | `calibration/` | LM optimiser, residuals/Jacobian, CRR de-Americanization |
 | `data/`, `config/` | live chains, implied forward curve, filters, SOFR/OIS curve |
-| `analytics/`, `strategies/`, `risk/` | enrichment, surfaces, payoffs, limits & scenarios |
+| `analytics/` | chain enrichment, Greeks, IV surface grids |
 | `services/` | orchestration boundary — app and CLI call these |
 | `app/`, `pipelines/` | Streamlit UI; headless entry points |

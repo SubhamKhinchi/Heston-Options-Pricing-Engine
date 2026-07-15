@@ -3,7 +3,7 @@ Streamlit landing page for the Heston options analytics app.
 
 Introduces the step-by-step pipeline and links to the page flow:
 Load Market Data -> Filter Options -> Calibrate Heston -> Price Contracts ->
-Volatility Surface -> Strategy Lab -> Risk Dashboard -> Mispricing Screener.
+Volatility Surface.
 Each page under app/pages/ is self-contained. Run with `streamlit run app/Home.py`.
 """
 
