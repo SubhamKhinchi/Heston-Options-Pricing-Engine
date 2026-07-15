@@ -25,6 +25,16 @@ nbconvert_run.log
 DOCS.md
 PLAN.md
 CLAUDE.md
+docs/
+
+# Research notebooks (kept locally)
+utils/
+
+# Chart assets: the README needs assets/*.png tracked; the generation scripts and the
+# interactive HTML (which belongs in the website repo) stay local.
+assets/*.py
+assets/*.html
+assets/*.json
 
 *.json
 *.xlsx
